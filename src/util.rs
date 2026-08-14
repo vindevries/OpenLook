@@ -1,0 +1,148 @@
+//! Small helpers: time formatting and HTML handling.
+
+use chrono::{DateTime, Local, Utc};
+
+pub fn now_unix() -> i64 {
+    Utc::now().timestamp()
+}
+
+fn parse(iso: &str) -> Option<DateTime<Local>> {
+    DateTime::parse_from_rfc3339(iso).ok().map(|dt| dt.with_timezone(&Local))
+}
+
+/// Message-list timestamp, in the style Outlook uses: time today, weekday
+/// this week, then dates.
+pub fn fmt_time(iso: &str) -> String {
+    let Some(dt) = parse(iso) else { return String::new() };
+    let now = Local::now();
+    let age = now.signed_duration_since(dt);
+    if dt.date_naive() == now.date_naive() {
+        dt.format("%H:%M").to_string()
+    } else if age.num_days() < 7 && age.num_seconds() >= 0 {
+        dt.format("%a %H:%M").to_string()
+    } else if dt.format("%Y").to_string() == now.format("%Y").to_string() {
+        dt.format("%-d %b").to_string()
+    } else {
+        dt.format("%d-%m-%Y").to_string()
+    }
+}
+
+/// Full timestamp for the reading pane header.
+pub fn fmt_full_time(iso: &str) -> String {
+    parse(iso).map(|dt| dt.format("%A %-d %B %Y, %H:%M").to_string()).unwrap_or_default()
+}
+
+/// "just now" / "5 min ago" / "14:03", for the sync status line.
+pub fn fmt_since(unix: i64) -> String {
+    let secs = now_unix() - unix;
+    if secs < 90 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 6 * 3600 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        DateTime::from_timestamp(unix, 0)
+            .map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
+            .unwrap_or_default()
+    }
+}
+
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Crude tag strip, used to build previews from HTML bodies and to show
+/// mail when the WebKit view is unavailable.
+pub fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut skip_until: Option<&str> = None;
+    let lower = html.to_lowercase();
+    let bytes: Vec<char> = html.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(tag) = skip_until {
+            // Inside <style>/<script>: skip to the closing tag.
+            let rest: String = lower_chars[i..].iter().take(tag.len()).collect();
+            if rest == tag {
+                skip_until = None;
+                i += tag.len();
+                in_tag = false;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        let c = bytes[i];
+        if c == '<' {
+            let ahead: String = lower_chars[i..].iter().take(7).collect();
+            if ahead.starts_with("<style") {
+                skip_until = Some("</style>");
+                i += 6;
+                continue;
+            }
+            if ahead.starts_with("<script") {
+                skip_until = Some("</script>");
+                i += 7;
+                continue;
+            }
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+            out.push(' ');
+        } else if !in_tag {
+            out.push(c);
+        }
+        i += 1;
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Wrap a mail body in a document with readable typography that follows the
+/// desktop light/dark theme.
+pub fn wrap_body(is_html: bool, content: &str, dark: bool) -> String {
+    let content = if is_html {
+        content.to_string()
+    } else {
+        format!("<pre>{}</pre>", escape_html(content))
+    };
+    let (fg, bg, quote, link) = if dark {
+        ("#e3e3e3", "#1e1e1e", "#9a9a9a", "#7cb7f2")
+    } else {
+        ("#1a1a1a", "#ffffff", "#555555", "#0f6cbd")
+    };
+    format!(
+        "<!doctype html><html><head><meta charset='utf-8'>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'><style>\
+         body{{font-family:'Segoe UI',Ubuntu,Cantarell,sans-serif;font-size:14px;\
+         line-height:1.5;color:{fg};background:{bg};margin:16px;\
+         overflow-wrap:break-word;}}\
+         pre{{white-space:pre-wrap;font:inherit;}}\
+         img{{max-width:100%;height:auto;}}\
+         table{{max-width:100%;}}\
+         blockquote{{border-left:3px solid {quote};margin-left:0;padding-left:12px;color:{quote};}}\
+         a{{color:{link};}}\
+         </style></head><body>{content}</body></html>"
+    )
+}

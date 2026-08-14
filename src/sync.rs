@@ -1,0 +1,528 @@
+//! Background sync engine.
+//!
+//! The UI never talks to the network. It reads the local database and sends
+//! commands here; this engine fetches from Graph, writes to the database and
+//! reports back with events. Changes made while offline are applied locally
+//! and queued in the outbox, then replayed when connectivity returns.
+
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
+
+use crate::auth::Auth;
+use crate::config::{account_key, db_path};
+use crate::db::Db;
+use crate::graph::{Change, Graph, GraphError};
+use crate::model::{AccountInfo, Body, MessageSummary, Op, Pending, Status};
+use crate::util::now_unix;
+
+/// How many messages the first sync of a folder pulls down.
+const WINDOW: u32 = 100;
+/// How many bodies to prefetch per folder so mail is readable offline.
+const PREFETCH: usize = 40;
+/// Concurrent body downloads.
+const PREFETCH_LANES: usize = 4;
+const SYNC_INTERVAL: Duration = Duration::from_secs(120);
+
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+pub fn runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to start async runtime")
+    })
+}
+
+#[derive(Debug, Clone)]
+pub enum Mode {
+    Demo,
+    Account(AccountInfo),
+}
+
+impl Mode {
+    pub fn key(&self) -> String {
+        match self {
+            Mode::Demo => "demo".into(),
+            Mode::Account(a) => account_key(&a.username),
+        }
+    }
+
+    /// Human-readable mailbox name, used in error messages.
+    pub fn label(&self) -> String {
+        match self {
+            Mode::Demo => "demo mailbox".into(),
+            Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
+            Mode::Account(a) => a.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Cmd {
+    /// Refresh folder list plus the given folder (or the default one).
+    SyncAll(Option<String>),
+    SyncFolder(String),
+    /// Make sure a message body is cached, downloading it if needed.
+    OpenMessage(String),
+    /// Try to push queued changes now.
+    Flush,
+    SetOnline(bool),
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    FoldersChanged,
+    MessagesChanged(String),
+    BodyReady(String),
+    StatusChanged(Status),
+    Failed(String),
+    Notice(String),
+}
+
+/// A signed-in (or demo) mailbox: its cache, plus the engine driving it.
+pub struct Session {
+    pub db: Db,
+    pub mode: Mode,
+    cmd_tx: async_channel::Sender<Cmd>,
+    pub events: async_channel::Receiver<Event>,
+}
+
+impl Session {
+    pub fn new(mode: Mode, auth: Arc<Mutex<Auth>>, http: reqwest::Client) -> anyhow::Result<Session> {
+        let db = Db::open(&db_path(&mode.key()))?;
+        if matches!(mode, Mode::Demo) && db.is_empty() {
+            crate::demo::seed(&db)?;
+        }
+        let (cmd_tx, cmd_rx) = async_channel::unbounded::<Cmd>();
+        let (event_tx, events) = async_channel::unbounded::<Event>();
+
+        let graph = match &mode {
+            Mode::Demo => None,
+            Mode::Account(account) => {
+                Some(Graph::new(http, auth, account.username.clone()))
+            }
+        };
+        let engine = Engine {
+            db: db.clone(),
+            graph,
+            events: event_tx,
+            status: Status::default(),
+            last_folder: None,
+            label: mode.label(),
+        };
+        runtime().spawn(engine.run(cmd_rx));
+        Ok(Session { db, mode, cmd_tx, events })
+    }
+
+    pub fn send(&self, cmd: Cmd) {
+        let _ = self.cmd_tx.try_send(cmd);
+    }
+
+    pub fn is_demo(&self) -> bool {
+        matches!(self.mode, Mode::Demo)
+    }
+
+    pub fn account(&self) -> Option<&AccountInfo> {
+        match &self.mode {
+            Mode::Account(a) => Some(a),
+            Mode::Demo => None,
+        }
+    }
+
+    /// Label for this mailbox in the folder pane.
+    pub fn title(&self) -> String {
+        match &self.mode {
+            Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
+            Mode::Account(a) => a.name.clone(),
+            Mode::Demo => "Demo mailbox".to_string(),
+        }
+    }
+
+    /// Apply a mailbox change: immediately to the local database (so the UI
+    /// updates at once, online or not), then queue it for the server.
+    pub fn apply(&self, op: Op) -> anyhow::Result<()> {
+        apply_local(&self.db, &op)?;
+        if self.is_demo() {
+            if let Op::Send { local_id, .. } = &op {
+                self.db.clear_pending_flag(local_id)?;
+            }
+        } else {
+            self.db.enqueue(&op)?;
+            self.send(Cmd::Flush);
+        }
+        Ok(())
+    }
+
+    pub fn queued_count(&self) -> i64 {
+        self.db.queued_count()
+    }
+}
+
+/// The local half of an operation — what the user sees happen instantly.
+pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
+    match op {
+        Op::MarkRead { message_id, is_read } => db.set_read(message_id, *is_read)?,
+        Op::Delete { message_id, purge } => match (purge, db.folder_id_by_name("Deleted Items")) {
+            (false, Some(bin)) => db.move_message(message_id, &bin)?,
+            _ => db.remove_message(message_id)?,
+        },
+        Op::Send { local_id, message } => {
+            let folder = db
+                .folder_id_by_name("Sent Items")
+                .or_else(|| db.folder_id_by_name("Drafts"))
+                .unwrap_or_default();
+            let body = Body { is_html: false, content: message.body.clone() };
+            let summary = MessageSummary {
+                id: local_id.clone(),
+                folder_id: folder,
+                subject: message.subject.clone(),
+                from: crate::model::Address::new("You", ""),
+                received: chrono::Utc::now().to_rfc3339(),
+                preview: message.body.chars().take(120).collect(),
+                is_read: true,
+                has_attachments: false,
+                pending: Pending::Queued,
+            };
+            let to: Vec<_> = message.to.iter().map(crate::model::Address::bare).collect();
+            let cc: Vec<_> = message.cc.iter().map(crate::model::Address::bare).collect();
+            db.insert_local_message(&summary, &to, &cc, &body)?;
+        }
+    }
+    Ok(())
+}
+
+struct Engine {
+    db: Db,
+    /// `None` in demo mode: everything stays local.
+    graph: Option<Graph>,
+    events: async_channel::Sender<Event>,
+    status: Status,
+    last_folder: Option<String>,
+    /// Which mailbox this engine serves, for error messages.
+    label: String,
+}
+
+impl Engine {
+    async fn run(mut self, cmd_rx: async_channel::Receiver<Cmd>) {
+        let mut ticker = tokio::time::interval(SYNC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick fires immediately; ignore it
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Ok(cmd) => self.handle(cmd).await,
+                    // The window is gone: shut the engine down.
+                    Err(_) => break,
+                },
+                _ = ticker.tick() => {
+                    self.flush().await;
+                    let folder = self.last_folder.clone();
+                    self.sync_all(folder).await;
+                }
+            }
+        }
+    }
+
+    fn emit(&self, event: Event) {
+        let _ = self.events.try_send(event);
+    }
+
+    fn publish_status(&mut self) {
+        self.status.queued = self.db.queued_count();
+        self.status.last_sync =
+            self.db.meta("last_sync").and_then(|v| v.parse::<i64>().ok());
+        self.emit(Event::StatusChanged(self.status.clone()));
+    }
+
+    async fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::SyncAll(folder) => {
+                if folder.is_some() {
+                    self.last_folder = folder.clone();
+                }
+                self.flush().await;
+                self.sync_all(folder).await;
+            }
+            Cmd::SyncFolder(id) => {
+                self.last_folder = Some(id.clone());
+                if self.graph.is_some() {
+                    self.status.syncing = true;
+                    self.publish_status();
+                    self.sync_folder(&id).await;
+                    self.status.syncing = false;
+                    self.publish_status();
+                }
+            }
+            Cmd::OpenMessage(id) => self.ensure_body(&id).await,
+            Cmd::Flush => {
+                self.flush().await;
+                self.publish_status();
+            }
+            Cmd::SetOnline(online) => {
+                let was_offline = !self.status.online;
+                self.status.online = online;
+                self.publish_status();
+                if online && was_offline {
+                    self.flush().await;
+                    let folder = self.last_folder.clone();
+                    self.sync_all(folder).await;
+                }
+            }
+        }
+    }
+
+    /// Record the outcome of a network call. Anything other than "we are
+    /// offline" is surfaced to the user and logged — an empty mailbox with
+    /// no explanation is the worst possible outcome.
+    fn note_result<T>(&mut self, result: &Result<T, GraphError>) {
+        match result {
+            Ok(_) => {
+                self.status.online = true;
+                self.status.detail = None;
+            }
+            Err(e) if e.is_offline() => {
+                self.status.online = false;
+                self.status.detail = Some(format!(
+                    "Offline — showing cached mail ({})",
+                    e.detail().unwrap_or("no network")
+                ));
+            }
+            Err(e) => {
+                let message = format!("{}: {e}", self.label);
+                eprintln!("openlook: {message}");
+                if let Some(detail) = e.detail() {
+                    eprintln!("openlook:   {detail}");
+                }
+                self.status.detail = Some(e.to_string());
+                self.emit(Event::Failed(message));
+            }
+        }
+    }
+
+    async fn sync_all(&mut self, folder: Option<String>) {
+        let Some(graph) = self.graph.clone() else {
+            // Demo mode: the cache is the whole world.
+            let _ = self.db.recompute_counts();
+            self.emit(Event::FoldersChanged);
+            return;
+        };
+        self.status.syncing = true;
+        self.publish_status();
+
+        let folders = graph.folders().await;
+        self.note_result(&folders);
+        if let Ok(folders) = folders {
+            if self.db.upsert_folders(&folders).is_ok() {
+                self.emit(Event::FoldersChanged);
+            }
+            let target = folder
+                .or_else(|| self.db.folder_id_by_name("Inbox"))
+                .or_else(|| folders.first().map(|f| f.id.clone()));
+            if let Some(id) = target {
+                self.last_folder = Some(id.clone());
+                self.sync_folder(&id).await;
+            }
+            // Keep the inbox warm even while another folder is open.
+            if let Some(inbox) = self.db.folder_id_by_name("Inbox") {
+                if self.last_folder.as_deref() != Some(inbox.as_str()) {
+                    self.sync_folder(&inbox).await;
+                }
+            }
+            let _ = self.db.set_meta("last_sync", &now_unix().to_string());
+        }
+        self.status.syncing = false;
+        self.publish_status();
+    }
+
+    async fn sync_folder(&mut self, folder_id: &str) {
+        let Some(graph) = self.graph.clone() else { return };
+
+        // Incremental path: ask only for what changed since last time.
+        if let Some(link) = self.db.delta_link(folder_id) {
+            let page = graph.delta(folder_id, Some(&link), 20).await;
+            self.note_result(&page);
+            match page {
+                Ok(page) => {
+                    let mut upserts = Vec::new();
+                    let mut removed = Vec::new();
+                    for change in page.changes {
+                        match change {
+                            Change::Upsert(m) => upserts.push(m),
+                            Change::Removed(id) => removed.push(id),
+                        }
+                    }
+                    let changed = !upserts.is_empty() || !removed.is_empty();
+                    let _ = self.db.upsert_messages(&upserts);
+                    for id in &removed {
+                        let _ = self.db.remove_message(id);
+                    }
+                    if let Some(next) = page.delta_link {
+                        let _ = self.db.set_delta_link(folder_id, Some(&next));
+                    }
+                    if changed {
+                        self.emit(Event::MessagesChanged(folder_id.to_string()));
+                    }
+                    self.prefetch_bodies(folder_id).await;
+                    return;
+                }
+                Err(e) if e.is_offline() => return,
+                Err(_) => {
+                    // Token rejected or expired — fall back to a full window.
+                    let _ = self.db.set_delta_link(folder_id, None);
+                }
+            }
+        }
+
+        let window = graph.messages_window(folder_id, WINDOW).await;
+        self.note_result(&window);
+        let Ok(messages) = window else { return };
+        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+        let oldest = messages.iter().map(|m| m.received.as_str()).min().unwrap_or("").to_string();
+        let _ = self.db.upsert_messages(&messages);
+        let _ = self.db.reconcile_window(folder_id, &ids, &oldest);
+        self.emit(Event::MessagesChanged(folder_id.to_string()));
+
+        // Start the incremental chain from "now" so later syncs are cheap.
+        if let Ok(Some(token)) = graph.delta_token_latest(folder_id).await {
+            let _ = self.db.set_delta_link(folder_id, Some(&token));
+        }
+        self.prefetch_bodies(folder_id).await;
+    }
+
+    /// Download the newest bodies so they are readable without a network.
+    async fn prefetch_bodies(&mut self, folder_id: &str) {
+        let Some(graph) = self.graph.clone() else { return };
+        let Ok(ids) = self.db.missing_bodies(folder_id, PREFETCH) else { return };
+        if ids.is_empty() {
+            return;
+        }
+        for chunk in ids.chunks(PREFETCH_LANES) {
+            let mut set = tokio::task::JoinSet::new();
+            for id in chunk {
+                let graph = graph.clone();
+                let db = self.db.clone();
+                let id = id.clone();
+                set.spawn(async move {
+                    match graph.detail(&id).await {
+                        Ok((to, cc, body)) => {
+                            let _ = db.set_body(&id, &body, &to, &cc);
+                            Ok(id)
+                        }
+                        Err(e) => Err(e),
+                    }
+                });
+            }
+            let mut offline = false;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(id)) => self.emit(Event::BodyReady(id)),
+                    Ok(Err(e)) => {
+                        if e.is_offline() {
+                            offline = true;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            if offline {
+                self.status.online = false;
+                self.status.detail = Some("Offline — showing cached mail".into());
+                self.publish_status();
+                return;
+            }
+        }
+    }
+
+    async fn ensure_body(&mut self, id: &str) {
+        let already = matches!(self.db.message(id), Ok(Some(m)) if m.body.is_some());
+        if already {
+            return;
+        }
+        let Some(graph) = self.graph.clone() else {
+            self.emit(Event::Failed("This message is not available offline.".into()));
+            return;
+        };
+        let detail = graph.detail(id).await;
+        self.note_result(&detail);
+        match detail {
+            Ok((to, cc, body)) => {
+                if self.db.set_body(id, &body, &to, &cc).is_ok() {
+                    self.emit(Event::BodyReady(id.to_string()));
+                }
+            }
+            Err(e) if e.is_offline() => {
+                self.publish_status();
+                self.emit(Event::Failed(
+                    "That message hasn't been downloaded yet, and you're offline.".into(),
+                ));
+            }
+            Err(e) => self.emit(Event::Failed(e.to_string())),
+        }
+    }
+
+    /// Replay queued changes. Anything that fails for a retryable reason
+    /// stays in the queue for the next attempt.
+    async fn flush(&mut self) {
+        let Some(graph) = self.graph.clone() else { return };
+        let Ok(queued) = self.db.queued() else { return };
+        if queued.is_empty() {
+            return;
+        }
+        let mut sent_any = false;
+        for (row_id, op, attempts) in queued {
+            let result = match &op {
+                Op::MarkRead { message_id, is_read } => graph.set_read(message_id, *is_read).await,
+                Op::Delete { message_id, purge } => graph.delete(message_id, *purge).await,
+                Op::Send { message, .. } => graph.send_mail(message).await,
+            };
+            match result {
+                Ok(()) => {
+                    let _ = self.db.dequeue(row_id);
+                    if let Op::Send { local_id, .. } = &op {
+                        // The server files its own copy in Sent Items; drop
+                        // the local placeholder so it does not show twice.
+                        let _ = self.db.remove_message(local_id);
+                        sent_any = true;
+                    }
+                    self.status.online = true;
+                }
+                Err(GraphError::NotFound) => {
+                    // Already gone server-side; nothing left to do.
+                    let _ = self.db.dequeue(row_id);
+                }
+                Err(e) if e.should_retry() => {
+                    let _ = self.db.record_failure(row_id, &e.to_string());
+                    if e.is_offline() {
+                        self.status.online = false;
+                        self.status.detail = Some("Offline — changes will sync later".into());
+                        self.publish_status();
+                        return;
+                    }
+                    if attempts >= 8 {
+                        self.emit(Event::Failed(format!("Still retrying: {e}")));
+                    }
+                }
+                Err(e) => {
+                    let _ = self.db.dequeue(row_id);
+                    if matches!(op, Op::Send { .. }) {
+                        self.emit(Event::Failed(format!("Message not sent: {e}")));
+                    }
+                }
+            }
+        }
+        if sent_any {
+            if let Some(sent) = self.db.folder_id_by_name("Sent Items") {
+                self.sync_folder(&sent).await;
+                self.emit(Event::MessagesChanged(sent));
+            }
+            self.emit(Event::Notice("Message sent".into()));
+        }
+        self.publish_status();
+    }
+}

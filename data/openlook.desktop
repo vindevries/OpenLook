@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=OpenLook
+GenericName=Mail Client
+Comment=Outlook-style mail client for Microsoft 365
+Exec=openlook
+Icon=openlook
+Terminal=false
+Type=Application
+Categories=Office;Email;Network;GTK;
+Keywords=email;mail;outlook;microsoft;365;
+StartupWMClass=com.opslogix.Openlook

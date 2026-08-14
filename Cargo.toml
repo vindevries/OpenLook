@@ -1,0 +1,36 @@
+[package]
+name = "openlook"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+description = "An Outlook-style native mail client for Linux, with offline mail"
+license = "MIT"
+default-run = "openlook"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.8", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.6", features = ["v1_4"] }
+webkit = { package = "webkit6", version = "0.3", optional = true }
+glib = "0.19"
+gio = "0.19"
+
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
+async-channel = "2"
+
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+anyhow = "1"
+urlencoding = "2"
+
+[features]
+default = ["html-view"]
+# Render mail bodies with WebKitGTK. Without it, bodies render as text.
+html-view = ["dep:webkit"]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
