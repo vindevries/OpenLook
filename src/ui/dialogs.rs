@@ -386,7 +386,7 @@ pub fn show_about(state: &Rc<State>) {
         .version(env!("CARGO_PKG_VERSION"))
         .comments("An Outlook-style native mail client for Linux, with offline mail.")
         .developer_name("Vincent")
-        .license_type(gtk::License::MitX11)
+        .license_type(gtk::License::Agpl30)
         .build()
         .present();
 }
