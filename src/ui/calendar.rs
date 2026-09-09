@@ -10,7 +10,9 @@ use gtk::pango::EllipsizeMode;
 
 use crate::model::CalendarEvent;
 use crate::sync::Cmd;
+use crate::ui::widgets::ToolbarView;
 use crate::ui::window::State;
+use crate::util::html_to_text;
 
 /// Events drawn in a day cell before it collapses into "+N more".
 const CHIPS_PER_DAY: usize = 3;
@@ -29,6 +31,10 @@ pub struct CalendarUi {
     selected: RefCell<NaiveDate>,
     /// Set while rebuilding, so cell clicks are ignored.
     building: Cell<bool>,
+    /// The day cells, so selecting a day can restyle them in place rather
+    /// than rebuilding the grid — a rebuild would destroy the chip being
+    /// double-clicked before the second click landed.
+    cells: RefCell<Vec<(NaiveDate, gtk::Box)>>,
 }
 
 impl CalendarUi {
@@ -126,6 +132,7 @@ impl CalendarUi {
             month: RefCell::new(first_of_month(today_date)),
             selected: RefCell::new(today_date),
             building: Cell::new(false),
+            cells: RefCell::new(Vec::new()),
         }
     }
 }
@@ -264,6 +271,7 @@ pub fn refresh(state: &Rc<State>) {
     }
 
     let today = Local::now().date_naive();
+    let mut cells: Vec<(NaiveDate, gtk::Box)> = Vec::with_capacity(42);
     for cell in 0..42 {
         let day = start + Duration::days(cell);
         let day_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -305,6 +313,17 @@ pub fn refresh(state: &Rc<State>) {
             if event.cancelled {
                 chip.add_css_class("event-cancelled");
             }
+            // Double-click opens the appointment, as in Outlook.
+            let gesture = gtk::GestureClick::new();
+            let s = state.clone();
+            let event_id = event.id.clone();
+            let owner = *session;
+            gesture.connect_pressed(move |_, presses, _, _| {
+                if presses >= 2 {
+                    open_event(&s, owner, &event_id);
+                }
+            });
+            chip.add_controller(gesture);
             day_box.append(&chip);
         }
         if today_events.len() > CHIPS_PER_DAY {
@@ -321,28 +340,65 @@ pub fn refresh(state: &Rc<State>) {
             if s.calendar.building.get() {
                 return;
             }
-            *s.calendar.selected.borrow_mut() = day;
-            refresh(&s);
+            select_day(&s, day);
         });
         day_box.add_controller(gesture);
 
+        cells.push((day, day_box.clone()));
         ui.grid.attach(&day_box, (cell % 7) as i32, (cell / 7) as i32, 1, 1);
     }
+    *ui.cells.borrow_mut() = cells;
     ui.building.set(false);
 
-    // Day detail
+    refresh_day_panel(state);
+}
+
+/// Select a day without rebuilding the grid.
+pub fn select_day(state: &Rc<State>, day: NaiveDate) {
+    {
+        let mut selected = state.calendar.selected.borrow_mut();
+        if *selected == day {
+            return;
+        }
+        *selected = day;
+    }
+    for (date, cell) in state.calendar.cells.borrow().iter() {
+        if *date == day {
+            cell.add_css_class("cal-selected");
+        } else {
+            cell.remove_css_class("cal-selected");
+        }
+    }
+    refresh_day_panel(state);
+}
+
+/// Fill the panel beside the grid with the selected day's appointments.
+pub fn refresh_day_panel(state: &Rc<State>) {
+    let ui = &state.calendar;
+    let selected = *ui.selected.borrow();
     ui.day_title.set_text(&selected.format("%A %-d %B %Y").to_string());
     while let Some(row) = ui.day_list.row_at_index(0) {
         ui.day_list.remove(&row);
     }
+    let events = events_for_grid(state, selected, selected + Duration::days(1));
     for (session, event) in events.iter().filter(|(_, e)| occurs_on(e, selected)) {
-        ui.day_list.append(&event_row(*session, event));
+        ui.day_list.append(&event_row(state, *session, event));
     }
 }
 
-fn event_row(session: usize, event: &CalendarEvent) -> gtk::ListBoxRow {
+fn event_row(state: &Rc<State>, session: usize, event: &CalendarEvent) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_selectable(false);
+
+    let gesture = gtk::GestureClick::new();
+    let s = state.clone();
+    let event_id = event.id.clone();
+    gesture.connect_pressed(move |_, presses, _, _| {
+        if presses >= 2 {
+            open_event(&s, session, &event_id);
+        }
+    });
+    row.add_controller(gesture);
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -390,4 +446,170 @@ fn event_row(session: usize, event: &CalendarEvent) -> gtk::ListBoxRow {
     }
     row.set_child(Some(&row_box));
     row
+}
+
+/// An open appointment. Kept so the body can be filled in when it arrives.
+pub struct AppointmentWindow {
+    pub id: String,
+    window: adw::Window,
+    body_label: gtk::Label,
+    attendees_label: gtk::Label,
+}
+
+/// Open an appointment: cached details right away, body fetched if missing.
+pub fn open_event(state: &Rc<State>, session: usize, id: &str) {
+    // Already open? Just bring it forward.
+    if let Some(existing) = state.appointments.borrow().iter().find(|a| a.id == id) {
+        existing.window.present();
+        return;
+    }
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some((event, body, attendees))) = db.event(id) else { return };
+
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(false)
+        .default_width(580)
+        .default_height(520)
+        .title(&event.subject)
+        .build();
+    let view = ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(16)
+        .margin_bottom(12)
+        .margin_start(20)
+        .margin_end(20)
+        .build();
+
+    let subject = gtk::Label::builder().label(&event.subject).xalign(0.0).wrap(true).build();
+    subject.add_css_class("mail-subject");
+    if event.cancelled {
+        subject.add_css_class("event-cancelled");
+    }
+    content.append(&subject);
+
+    let when = if event.all_day {
+        match DateTime::parse_from_rfc3339(&event.start) {
+            Ok(dt) => format!("All day · {}", dt.naive_utc().date().format("%A %-d %B %Y")),
+            Err(_) => "All day".to_string(),
+        }
+    } else {
+        match (local_of(&event.start), local_of(&event.end)) {
+            (Some(a), Some(b)) => format!(
+                "{} · {} – {}",
+                a.format("%A %-d %B %Y"),
+                a.format("%H:%M"),
+                b.format("%H:%M")
+            ),
+            _ => String::new(),
+        }
+    };
+    let when_label = gtk::Label::builder().label(&when).xalign(0.0).wrap(true).build();
+    when_label.add_css_class(&format!("mailbox-text-{}", session % 6));
+    content.append(&when_label);
+
+    for (prefix, value) in [
+        ("Where", event.location.clone()),
+        ("Organiser", event.organizer.clone()),
+        ("Mailbox", state.sessions.borrow().get(session).map(|s| s.title()).unwrap_or_default()),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
+        let label =
+            gtk::Label::builder().label(&format!("{prefix}: {value}")).xalign(0.0).wrap(true).build();
+        label.add_css_class("dim-label");
+        label.add_css_class("caption");
+        content.append(&label);
+    }
+
+    let attendees_label = gtk::Label::builder().xalign(0.0).wrap(true).visible(false).build();
+    attendees_label.add_css_class("dim-label");
+    attendees_label.add_css_class("caption");
+    content.append(&attendees_label);
+
+    content.append(&gtk::Separator::builder().margin_top(8).margin_bottom(8).build());
+
+    let body_label = gtk::Label::builder()
+        .xalign(0.0)
+        .yalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        // Selectable labels grab focus and highlight themselves on open;
+        // the text stays selectable with the mouse without that.
+        .can_focus(false)
+        .vexpand(true)
+        .build();
+    content.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&body_label)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+
+    view.set_content(Some(&content));
+    window.set_content(Some(view.widget()));
+
+    let entry = AppointmentWindow {
+        id: id.to_string(),
+        window: window.clone(),
+        body_label,
+        attendees_label,
+    };
+    fill_body(&entry, body.as_deref(), &attendees, &event.preview);
+    state.appointments.borrow_mut().push(entry);
+
+    // Forget it once closed, so a later reopen builds a fresh window.
+    {
+        let s = state.clone();
+        let id = id.to_string();
+        window.connect_close_request(move |_| {
+            s.appointments.borrow_mut().retain(|a| a.id != id);
+            gtk::glib::Propagation::Proceed
+        });
+    }
+
+    // Ask for the body; harmless when it is already cached.
+    if let Some(session) = state.sessions.borrow().get(session) {
+        session.send(Cmd::OpenEvent(id.to_string()));
+    }
+    window.present();
+}
+
+fn fill_body(entry: &AppointmentWindow, body: Option<&str>, attendees: &[String], preview: &str) {
+    let text = match body {
+        Some(body) if !body.trim().is_empty() => html_to_text(body),
+        _ if !preview.trim().is_empty() => preview.to_string(),
+        _ => "No description.".to_string(),
+    };
+    entry.body_label.set_text(&text);
+    if attendees.is_empty() {
+        entry.attendees_label.set_visible(false);
+    } else {
+        entry.attendees_label.set_text(&format!("Invited: {}", attendees.join(", ")));
+        entry.attendees_label.set_visible(true);
+    }
+}
+
+/// Called when a mailbox reports that an appointment body has arrived.
+pub fn event_ready(state: &Rc<State>, id: &str) {
+    if !state.appointments.borrow().iter().any(|a| a.id == id) {
+        return;
+    }
+    // The appointment can belong to any mailbox; take the first cache that
+    // holds it.
+    let caches: Vec<_> = state.sessions.borrow().iter().map(|s| s.db.clone()).collect();
+    for db in caches {
+        let Ok(Some((event, body, attendees))) = db.event(id) else { continue };
+        let appointments = state.appointments.borrow();
+        if let Some(entry) = appointments.iter().find(|a| a.id == id) {
+            fill_body(entry, body.as_deref(), &attendees, &event.preview);
+        }
+        return;
+    }
 }

@@ -19,7 +19,8 @@ Graph API and keeps a local copy so mail is readable **offline**.
 - Drag a message onto a folder to move it (within the same mailbox)
 - **Calendar**: a month view switched from the rail on the left, merging
   every mailbox's events (colour-coded), with a day panel showing times,
-  location and organiser. Cached like mail, so it reads offline
+  location and organiser; double-click an appointment to open it. Cached
+  like mail, so it reads offline
 - **Works offline**: mail is cached in SQLite and message bodies are
   prefetched, so the app opens instantly and stays readable with no network
 - **Changes made offline are queued** — read/unread, delete and messages you

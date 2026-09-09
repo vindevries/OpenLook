@@ -74,6 +74,8 @@ pub enum Cmd {
     SyncFolder(String),
     /// Make sure a message body is cached, downloading it if needed.
     OpenMessage(String),
+    /// Make sure an appointment's body is cached.
+    OpenEvent(String),
     /// Refresh the calendar for a window, given as RFC3339 UTC bounds.
     SyncCalendar { start: String, end: String },
     /// Try to push queued changes now.
@@ -87,6 +89,7 @@ pub enum Event {
     MessagesChanged(String),
     BodyReady(String),
     CalendarChanged,
+    EventReady(String),
     StatusChanged(Status),
     Failed(String),
     Notice(String),
@@ -269,6 +272,7 @@ impl Engine {
             }
             Cmd::OpenMessage(id) => self.ensure_body(&id).await,
             Cmd::SyncCalendar { start, end } => self.sync_calendar(&start, &end).await,
+            Cmd::OpenEvent(id) => self.ensure_event_body(&id).await,
             Cmd::Flush => {
                 self.flush().await;
                 self.publish_status();
@@ -403,6 +407,23 @@ impl Engine {
             }
         }
         self.prefetch_bodies(folder_id).await;
+    }
+
+    /// Fetch an appointment's body once, then serve it from the cache.
+    async fn ensure_event_body(&mut self, id: &str) {
+        let cached = matches!(self.db.event(id), Ok(Some((_, Some(_), _))));
+        if cached {
+            self.emit(Event::EventReady(id.to_string()));
+            return;
+        }
+        let Some(graph) = self.graph.clone() else { return };
+        let detail = graph.event_detail(id).await;
+        self.note_result(&detail);
+        if let Ok((body, attendees)) = detail {
+            if self.db.set_event_body(id, &body, &attendees).is_ok() {
+                self.emit(Event::EventReady(id.to_string()));
+            }
+        }
     }
 
     /// Refresh the cached calendar for a window. The server view is the

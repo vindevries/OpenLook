@@ -116,6 +116,8 @@ pub struct State {
     count_label: gtk::Label,
     connection_label: gtk::Label,
     pub calendar: crate::ui::calendar::CalendarUi,
+    /// Appointment windows currently open, so a body can be filled in.
+    pub appointments: RefCell<Vec<crate::ui::calendar::AppointmentWindow>>,
     view_stack: gtk::Stack,
     #[cfg(feature = "html-view")]
     webview: webkit::WebView,
@@ -554,6 +556,7 @@ pub fn build(app: &adw::Application) {
         count_label,
         connection_label,
         calendar,
+        appointments: RefCell::new(Vec::new()),
         view_stack,
         #[cfg(feature = "html-view")]
         webview,
@@ -815,6 +818,7 @@ pub fn listen(state: &Rc<State>, index: usize) {
                     }
                 }
                 Event::CalendarChanged => crate::ui::calendar::refresh(&state),
+                Event::EventReady(id) => crate::ui::calendar::event_ready(&state, &id),
                 Event::Failed(message) | Event::Notice(message) => toast(&state, &message),
             }
         }

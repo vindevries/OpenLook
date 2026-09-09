@@ -332,6 +332,33 @@ impl Graph {
         Ok(events)
     }
 
+    /// The full appointment: its body and who was invited.
+    pub async fn event_detail(&self, id: &str) -> GraphResult<(String, Vec<String>)> {
+        let url = format!(
+            "/me/events/{}?$select=body,attendees,onlineMeeting",
+            urlencoding::encode(id)
+        );
+        let event = self.get(&url).await?;
+        let body = event["body"]["content"].as_str().unwrap_or_default().to_string();
+        let attendees = event["attendees"]
+            .as_array()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|a| {
+                let email = &a["emailAddress"];
+                email["name"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| email["address"].as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        Ok((body, attendees))
+    }
+
     /// Full message: recipients plus the body.
     pub async fn detail(&self, id: &str) -> GraphResult<(Vec<Address>, Vec<Address>, Body)> {
         let url = format!(

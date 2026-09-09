@@ -80,6 +80,13 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Caches written before appointments could be opened lack these.
+        for statement in [
+            "ALTER TABLE events ADD COLUMN body TEXT",
+            "ALTER TABLE events ADD COLUMN attendees TEXT",
+        ] {
+            let _ = conn.execute(statement, []);
+        }
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -540,34 +547,87 @@ impl Db {
     /// truth for that window, so this also removes events cancelled or
     /// moved away since the last sync.
     pub fn replace_events(&self, start: &str, end: &str, events: &[CalendarEvent]) -> Result<()> {
+        let keep: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1",
-            params![start, end],
-        )?;
         {
+            // Drop only what the server no longer reports in this window, so
+            // cancellations disappear but already-fetched bodies survive.
+            let placeholders =
+                if keep.is_empty() { "''".to_string() } else { keep.iter().map(|_| "?").collect::<Vec<_>>().join(",") };
+            let sql = format!(
+                "DELETE FROM events WHERE start_utc < ?1 AND end_utc > ?2 AND id NOT IN ({placeholders})"
+            );
+            let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(end.to_string()), Box::new(start.to_string())];
+            for id in &keep {
+                args.push(Box::new(id.clone()));
+            }
+            tx.execute(&sql, rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())))?;
+
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO events
+                "INSERT INTO events
                      (id, subject, organizer, location, start_utc, end_utc,
                       all_day, cancelled, preview)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                     subject = excluded.subject, organizer = excluded.organizer,
+                     location = excluded.location, start_utc = excluded.start_utc,
+                     end_utc = excluded.end_utc, all_day = excluded.all_day,
+                     cancelled = excluded.cancelled, preview = excluded.preview",
             )?;
             for e in events {
                 stmt.execute(params![
-                    e.id,
-                    e.subject,
-                    e.organizer,
-                    e.location,
-                    e.start,
-                    e.end,
-                    e.all_day as i64,
-                    e.cancelled as i64,
-                    e.preview,
+                    e.id, e.subject, e.organizer, e.location, e.start, e.end,
+                    e.all_day as i64, e.cancelled as i64, e.preview,
                 ])?;
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// One cached appointment, with its body if it has been fetched.
+    pub fn event(&self, id: &str) -> Result<Option<(CalendarEvent, Option<String>, Vec<String>)>> {
+        let conn = self.conn();
+        let row = conn
+            .query_row(
+                "SELECT id, subject, organizer, location, start_utc, end_utc,
+                        all_day, cancelled, preview, body, attendees
+                   FROM events WHERE id = ?1",
+                params![id],
+                |r| {
+                    let body: Option<String> = r.get(9)?;
+                    let attendees: Option<String> = r.get(10)?;
+                    Ok((
+                        CalendarEvent {
+                            id: r.get(0)?,
+                            subject: r.get(1)?,
+                            organizer: r.get(2)?,
+                            location: r.get(3)?,
+                            start: r.get(4)?,
+                            end: r.get(5)?,
+                            all_day: r.get::<_, i64>(6)? != 0,
+                            cancelled: r.get::<_, i64>(7)? != 0,
+                            preview: r.get(8)?,
+                            mailbox: String::new(),
+                        },
+                        body,
+                        attendees
+                            .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+                            .unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn set_event_body(&self, id: &str, body: &str, attendees: &[String]) -> Result<()> {
+        self.conn().execute(
+            "UPDATE events SET body = ?2, attendees = ?3 WHERE id = ?1",
+            params![id, body, serde_json::to_string(attendees)?],
+        )?;
         Ok(())
     }
 

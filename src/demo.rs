@@ -272,7 +272,10 @@ fn seed_events(db: &Db) -> Result<()> {
                 end,
                 all_day: *all_day,
                 cancelled: false,
-                preview: String::new(),
+                preview: format!(
+                    "{subject} — organised by {organizer}. Double-click an \
+                     appointment to open it."
+                ),
                 mailbox: "Demo mailbox".to_string(),
             }
         })
