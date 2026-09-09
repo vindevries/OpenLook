@@ -1111,8 +1111,10 @@ pub fn reload_messages(state: &Rc<State>) {
 
     let shown = entries.iter().filter(|e| matches!(e, ListEntry::Message(_))).count();
     *state.entries.borrow_mut() = entries;
-    state.rebuilding.set(false);
 
+    // Putting the selection back is not the user opening the message, so it
+    // stays inside the rebuild: opening marks a message read, which would
+    // undo "mark as unread" the moment the list refreshed.
     match select_index {
         Some(index) => {
             if let Some(row) = state.message_list.row_at_index(index) {
@@ -1125,6 +1127,7 @@ pub fn reload_messages(state: &Rc<State>) {
             }
         }
     }
+    state.rebuilding.set(false);
 
     let unread = folder.as_ref().map(|f| f.unread_count).unwrap_or(0);
     let total = folder.as_ref().map(|f| f.total_count).unwrap_or(shown as i64);
