@@ -30,6 +30,12 @@ pub struct Settings {
     /// account prompt does not reappear at every launch.
     #[serde(default)]
     pub demo_ack: bool,
+    /// Widths of the folder pane and the message list, in pixels. Zero
+    /// means "not set yet", so the defaults apply.
+    #[serde(default)]
+    pub pane_folders: i32,
+    #[serde(default)]
+    pub pane_list: i32,
     /// HubSpot ticket pipelines to show. Each becomes its own section in
     /// the folder pane, with its stages as folders. Stage labels repeat
     /// across pipelines, so the label is kept alongside the id.
@@ -43,6 +49,8 @@ impl Default for Settings {
             client_id: DEFAULT_CLIENT_ID.into(),
             tenant: DEFAULT_TENANT.into(),
             demo_ack: false,
+            pane_folders: 0,
+            pane_list: 0,
             hubspot_pipelines: Vec::new(),
         }
     }

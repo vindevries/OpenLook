@@ -10,7 +10,11 @@ Graph API and keeps a local copy so mail is readable **offline**.
 ## Features
 
 - Classic Outlook three-pane layout: folder pane, message list, reading pane,
-  with a ribbon-style command bar and a status bar
+  with draggable dividers whose widths are remembered, a ribbon-style
+  command bar and a status bar
+- **HubSpot tickets** in their own pane beside Mail and Calendar: pipeline
+  stages as folders, tickets as rows, and a ticket's threads assembled in
+  the reading pane
 - **Several mailboxes at once** — each gets its own section in the folder
   pane, its own cache and its own sync, with a shared Favorites section on top
 - Message list grouped by date (Today / Yesterday / weekday / Last Week), an

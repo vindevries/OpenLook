@@ -313,8 +313,6 @@ pub fn build(app: &adw::Application) {
     command_bar.append(&command("view-refresh-symbolic", "Send / Receive", "win.refresh", "Refresh (F5)"));
 
     // ----- three panes --------------------------------------------------
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-
     let folder_list = gtk::ListBox::new();
     folder_list.set_selection_mode(gtk::SelectionMode::Single);
     folder_list.add_css_class("navigation-sidebar");
@@ -322,15 +320,12 @@ pub fn build(app: &adw::Application) {
     let folder_scroll = gtk::ScrolledWindow::builder()
         .child(&folder_list)
         .vexpand(true)
-        .width_request(250)
+        .width_request(150)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    body.append(&folder_scroll);
-    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-
     // Message list, with its own header strip (folder name, All/Unread, sort)
     let list_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    list_pane.set_size_request(400, -1);
+    list_pane.set_size_request(260, -1);
 
     let list_head = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -380,9 +375,6 @@ pub fn build(app: &adw::Application) {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build(),
     );
-    body.append(&list_pane);
-    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-
     // ----- reading pane -------------------------------------------------
     let reading = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     reading.add_named(
@@ -510,7 +502,24 @@ pub fn build(app: &adw::Application) {
     };
 
     reading.add_named(&reader, Some("message"));
-    body.append(&reading);
+
+    // Two nested panes give draggable dividers between the three columns.
+    // Only the reading pane takes up the slack when the window is resized,
+    // so the folder list and message list keep the width they were given.
+    let saved = crate::config::Settings::load();
+    let list_split = gtk::Paned::builder().orientation(gtk::Orientation::Horizontal).build();
+    list_split.set_start_child(Some(&list_pane));
+    list_split.set_end_child(Some(&reading));
+    list_split.set_resize_start_child(false);
+    list_split.set_shrink_start_child(false);
+    list_split.set_position(if saved.pane_list > 0 { saved.pane_list } else { 400 });
+
+    let body = gtk::Paned::builder().orientation(gtk::Orientation::Horizontal).build();
+    body.set_start_child(Some(&folder_scroll));
+    body.set_end_child(Some(&list_split));
+    body.set_resize_start_child(false);
+    body.set_shrink_start_child(false);
+    body.set_position(if saved.pane_folders > 0 { saved.pane_folders } else { 250 });
 
     // ----- status bar ---------------------------------------------------
     let status_bar = gtk::Box::builder()
@@ -680,6 +689,19 @@ pub fn build(app: &adw::Application) {
     render_status(&state);
     for session in state.sessions.borrow().iter() {
         session.send(Cmd::SyncAll(None));
+    }
+
+    {
+        // Remember where the dividers were left.
+        let body = body.clone();
+        let list_split = list_split.clone();
+        window.connect_close_request(move |_| {
+            let mut settings = crate::config::Settings::load();
+            settings.pane_folders = body.position();
+            settings.pane_list = list_split.position();
+            let _ = settings.save();
+            glib::Propagation::Proceed
+        });
     }
 
     window.present();
