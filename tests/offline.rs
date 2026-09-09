@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use openlook::db::Db;
-use openlook::model::{Op, Outgoing};
+use openlook::model::{MessagePatch, Op, Outgoing};
 use openlook::sync::apply_local;
 
 fn temp_db(name: &str) -> (Db, PathBuf) {
@@ -36,6 +36,60 @@ fn cached_mail_is_readable_without_network() {
 
     // Newest first.
     assert!(messages[0].received >= messages[1].received);
+    cleanup(&path);
+}
+
+/// Graph reports a message it has already sent once by listing only the
+/// properties that changed. Writing that as a whole message blanked the date
+/// and sender, which dropped the message to the bottom of the list under
+/// "Older" and left it looking as if it had vanished.
+#[test]
+fn a_partial_delta_entry_only_changes_what_it_carries() {
+    let (db, path) = temp_db("patch");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let before = db.messages(&inbox, "").unwrap().into_iter().find(|m| !m.is_read).unwrap();
+
+    // What arrives when the message is opened here or read on a phone: an id
+    // and an isRead, nothing else.
+    db.patch_messages(&[MessagePatch {
+        id: before.id.clone(),
+        is_read: Some(true),
+        ..Default::default()
+    }])
+    .unwrap();
+
+    let after = db
+        .messages(&inbox, "")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == before.id)
+        .expect("still in the folder");
+    assert!(after.is_read, "the property that did change is applied");
+    assert_eq!(after.received, before.received, "the date survives");
+    assert_eq!(after.subject, before.subject, "the subject survives");
+    assert_eq!(after.from, before.from, "the sender survives");
+
+    let folder = db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap();
+    assert_eq!(folder.unread_count, 2, "the badge follows the change");
+    cleanup(&path);
+}
+
+/// A fields-only entry for a message that was never cached cannot be turned
+/// into a usable row; writing one used to create a blank ghost message.
+#[test]
+fn a_partial_delta_entry_for_unknown_mail_is_ignored() {
+    let (db, path) = temp_db("patch-unknown");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let before = db.messages(&inbox, "").unwrap().len();
+
+    db.patch_messages(&[MessagePatch {
+        id: "not-in-the-cache".into(),
+        is_read: Some(false),
+        ..Default::default()
+    }])
+    .unwrap();
+
+    assert_eq!(db.messages(&inbox, "").unwrap().len(), before, "no ghost row appears");
     cleanup(&path);
 }
 

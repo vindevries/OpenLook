@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::Auth;
 use crate::model::{
-    Address, Body, CalendarEvent, Folder, MessageSummary, Outgoing, Pending, SendMode,
+    Address, Body, CalendarEvent, Folder, MessagePatch, MessageSummary, Outgoing, Pending, SendMode,
 };
 use crate::util::html_to_text;
 
@@ -99,6 +99,10 @@ pub type GraphResult<T> = Result<T, GraphError>;
 /// One incremental change from a delta query.
 pub enum Change {
     Upsert(MessageSummary),
+    /// A message Graph has reported before: the entry carries only the
+    /// properties that changed, so it patches the cached row instead of
+    /// replacing it.
+    Patch(MessagePatch),
     Removed(String),
 }
 
@@ -251,8 +255,13 @@ impl Graph {
                 }
                 if item.get("@removed").is_some() {
                     changes.push(Change::Removed(id));
-                } else {
+                } else if item.get("receivedDateTime").is_some() {
                     changes.push(Change::Upsert(parse_summary(item, folder_id)));
+                } else {
+                    // Only the changed properties came back. Read as a whole
+                    // message this would blank the date, sender and subject —
+                    // which drops the message to the bottom of every list.
+                    changes.push(Change::Patch(parse_patch(id, item)));
                 }
             }
             if let Some(delta) = data["@odata.deltaLink"].as_str() {
@@ -471,6 +480,24 @@ fn parse_address(v: &Value) -> Address {
 
 fn parse_addresses(v: &Value) -> Vec<Address> {
     v.as_array().map(|v| v.as_slice()).unwrap_or_default().iter().map(parse_address).collect()
+}
+
+/// Read a delta entry that carried only part of a message. Every field is
+/// optional here precisely because a missing one means "unchanged", not
+/// "empty".
+fn parse_patch(id: String, m: &Value) -> MessagePatch {
+    MessagePatch {
+        id,
+        folder_id: m["parentFolderId"].as_str().map(str::to_string),
+        subject: m["subject"].as_str().map(|s| {
+            if s.is_empty() { "(no subject)".to_string() } else { s.to_string() }
+        }),
+        from: m.get("from").filter(|v| !v.is_null()).map(parse_address),
+        received: m["receivedDateTime"].as_str().map(str::to_string),
+        preview: m["bodyPreview"].as_str().map(html_to_text),
+        is_read: m["isRead"].as_bool(),
+        has_attachments: m["hasAttachments"].as_bool(),
+    }
 }
 
 fn parse_summary(m: &Value, folder_id: &str) -> MessageSummary {

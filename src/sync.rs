@@ -377,15 +377,18 @@ impl Engine {
         match page {
             Ok(page) => {
                 let mut upserts = Vec::new();
+                let mut patches = Vec::new();
                 let mut removed = Vec::new();
                 for change in page.changes {
                     match change {
                         Change::Upsert(m) => upserts.push(m),
+                        Change::Patch(p) => patches.push(p),
                         Change::Removed(id) => removed.push(id),
                     }
                 }
-                let changed = !upserts.is_empty() || !removed.is_empty();
+                let changed = !upserts.is_empty() || !patches.is_empty() || !removed.is_empty();
                 let _ = self.db.upsert_messages(&upserts);
+                let _ = self.db.patch_messages(&patches);
                 for id in &removed {
                     let _ = self.db.remove_message(id);
                 }
