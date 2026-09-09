@@ -433,6 +433,22 @@ impl Db {
         Ok(())
     }
 
+    /// Point a cached row at a new server id. Moving a message server-side
+    /// creates a new item with a new id, so without this the next sync of
+    /// the destination folder would add a duplicate and leave a stale row.
+    pub fn rename_message(&self, old_id: &str, new_id: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE OR REPLACE messages SET id = ?2 WHERE id = ?1",
+            params![old_id, new_id],
+        )?;
+        conn.execute(
+            "UPDATE outbox SET message_id = ?2 WHERE message_id = ?1",
+            params![old_id, new_id],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_pending_flag(&self, id: &str) -> Result<()> {
         self.conn().execute("UPDATE messages SET pending = 0 WHERE id = ?1", params![id])?;
         Ok(())
@@ -442,9 +458,9 @@ impl Db {
 
     pub fn enqueue(&self, op: &Op) -> Result<i64> {
         let message_id = match op {
-            Op::MarkRead { message_id, .. } | Op::Delete { message_id, .. } => {
-                Some(message_id.clone())
-            }
+            Op::MarkRead { message_id, .. }
+            | Op::Delete { message_id, .. }
+            | Op::Move { message_id, .. } => Some(message_id.clone()),
             Op::Send { local_id, .. } => Some(local_id.clone()),
         };
         let conn = self.conn();

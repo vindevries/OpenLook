@@ -176,6 +176,7 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
             (false, Some(bin)) => db.move_message(message_id, &bin)?,
             _ => db.remove_message(message_id)?,
         },
+        Op::Move { message_id, folder_id } => db.move_message(message_id, folder_id)?,
         Op::Send { local_id, message } => {
             let folder = db
                 .folder_id_by_name("Sent Items")
@@ -471,6 +472,16 @@ impl Engine {
         }
     }
 
+    /// A server-side move renames the message; keep the cache in step so a
+    /// later sync of the destination folder does not insert a duplicate.
+    fn adopt_new_id(&self, old_id: &str, new_id: Option<String>) {
+        if let Some(new_id) = new_id {
+            if new_id != old_id {
+                let _ = self.db.rename_message(old_id, &new_id);
+            }
+        }
+    }
+
     /// Replay queued changes. Anything that fails for a retryable reason
     /// stays in the queue for the next attempt.
     async fn flush(&mut self) {
@@ -483,7 +494,14 @@ impl Engine {
         for (row_id, op, attempts) in queued {
             let result = match &op {
                 Op::MarkRead { message_id, is_read } => graph.set_read(message_id, *is_read).await,
-                Op::Delete { message_id, purge } => graph.delete(message_id, *purge).await,
+                Op::Delete { message_id, purge } => graph
+                    .delete(message_id, *purge)
+                    .await
+                    .map(|new_id| self.adopt_new_id(message_id, new_id)),
+                Op::Move { message_id, folder_id } => graph
+                    .move_message(message_id, folder_id)
+                    .await
+                    .map(|new_id| self.adopt_new_id(message_id, new_id)),
                 Op::Send { message, .. } => graph.send_mail(message).await,
             };
             match result {

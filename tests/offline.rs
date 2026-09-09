@@ -175,3 +175,48 @@ fn search_filters_the_cached_folder() {
     assert!(db.messages(&inbox, "zzzz-no-match").unwrap().is_empty());
     cleanup(&path);
 }
+
+#[test]
+fn archiving_is_queued_for_the_server() {
+    let (db, path) = temp_db("archive");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let archive = db.folder_id_by_name("Archive").unwrap();
+    let msg = db.messages(&inbox, "").unwrap().remove(0);
+
+    let op = Op::Move { message_id: msg.id.clone(), folder_id: archive.clone() };
+    apply_local(&db, &op).unwrap();
+    db.enqueue(&op).unwrap();
+
+    // Moves locally at once, so the list updates immediately...
+    assert_eq!(db.message(&msg.id).unwrap().unwrap().summary.folder_id, archive);
+    // ...and is queued, so it actually reaches the server. Archive used to
+    // write straight to the cache and never enqueue anything.
+    assert_eq!(db.queued_count(), 1);
+    assert!(matches!(db.queued().unwrap()[0].1, Op::Move { .. }));
+
+    // The other half of that bug: a sync still showing the message in the
+    // Inbox must not drag it back out of Archive.
+    let stale = openlook::model::MessageSummary { folder_id: inbox.clone(), ..msg.clone() };
+    db.upsert_messages(&[stale]).unwrap();
+    assert_eq!(
+        db.message(&msg.id).unwrap().unwrap().summary.folder_id,
+        archive,
+        "a queued move must survive a sync that still reports the old folder"
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn a_server_move_renames_the_cached_message() {
+    let (db, path) = temp_db("rename");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let msg = db.messages(&inbox, "").unwrap().remove(0);
+
+    // Graph gives a moved message a new id; the cache has to follow it,
+    // otherwise the next sync adds a duplicate beside a stale row.
+    db.rename_message(&msg.id, "server-side-new-id").unwrap();
+    assert!(db.message(&msg.id).unwrap().is_none());
+    let moved = db.message("server-side-new-id").unwrap().expect("row follows the new id");
+    assert_eq!(moved.summary.subject, msg.subject);
+    cleanup(&path);
+}

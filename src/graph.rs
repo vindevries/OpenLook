@@ -288,17 +288,24 @@ impl Graph {
         Ok(())
     }
 
+    /// Move a message to another folder. Graph creates a new item in the
+    /// destination, so the id changes; the new one comes back in the reply.
+    pub async fn move_message(&self, id: &str, destination: &str) -> GraphResult<Option<String>> {
+        let url = format!("{GRAPH}/me/messages/{}/move", urlencoding::encode(id));
+        let moved =
+            self.send(self.http.post(url).json(&json!({ "destinationId": destination }))).await?;
+        Ok(moved.and_then(|v| v["id"].as_str().map(str::to_string)))
+    }
+
     /// Move to Deleted Items, the way Outlook's Delete works — or delete for
     /// good when the message was already in the bin.
-    pub async fn delete(&self, id: &str, purge: bool) -> GraphResult<()> {
+    pub async fn delete(&self, id: &str, purge: bool) -> GraphResult<Option<String>> {
         if purge {
             let url = format!("{GRAPH}/me/messages/{}", urlencoding::encode(id));
             self.send(self.http.delete(url)).await?;
-            return Ok(());
+            return Ok(None);
         }
-        let url = format!("{GRAPH}/me/messages/{}/move", urlencoding::encode(id));
-        self.send(self.http.post(url).json(&json!({ "destinationId": "deleteditems" }))).await?;
-        Ok(())
+        self.move_message(id, "deleteditems").await
     }
 
     pub async fn send_mail(&self, msg: &Outgoing) -> GraphResult<()> {

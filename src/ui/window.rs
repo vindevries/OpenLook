@@ -9,7 +9,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use chrono::{DateTime, Local};
 use gtk::pango::EllipsizeMode;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use tokio::sync::Mutex;
 #[cfg(feature = "html-view")]
 use webkit::prelude::*;
@@ -21,6 +21,7 @@ use crate::model::{
 use crate::sync::{runtime, Cmd, Event, Mode, Session};
 use crate::ui::compose::ComposeWindow;
 use crate::ui::dialogs;
+use crate::ui::widgets::ToolbarView;
 use crate::util::{fmt_full_time, fmt_since, fmt_time, wrap_body};
 
 /// Folders shown under Favorites for a single-mailbox setup.
@@ -486,13 +487,13 @@ pub fn build(app: &adw::Application) {
     status_bar.append(&status_spacer);
     status_bar.append(&connection_label);
 
-    let view = adw::ToolbarView::new();
+    let view = ToolbarView::new();
     view.add_top_bar(&header);
     view.add_top_bar(&command_bar);
     view.set_content(Some(&body));
     view.add_bottom_bar(&status_bar);
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&view));
+    toasts.set_child(Some(view.widget()));
     window.set_content(Some(&toasts));
 
     let state = Rc::new(State {
@@ -694,7 +695,9 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
             if let Some(uri) = action.request().and_then(|r| r.uri()) {
                 if uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:")
                 {
-                    gtk::UriLauncher::new(&uri).launch(Some(&s.window), gio::Cancellable::NONE, |_| {});
+                    // gtk::UriLauncher needs GTK 4.10; this works back to 4.6.
+                    #[allow(deprecated)]
+                    gtk::show_uri(Some(&s.window), &uri, gdk::CURRENT_TIME);
                 }
             }
             decision.ignore();
@@ -1281,12 +1284,22 @@ fn archive_current(state: &Rc<State>) {
         toast(state, "This mailbox has no Archive folder.");
         return;
     };
-    if db.move_message(&detail.summary.id, &archive).is_ok() {
-        show_message(state, None);
-        toast(state, "Moved to Archive");
-        reload_messages(state);
-        reload_folders(state, false);
+    if detail.summary.folder_id == archive {
+        toast(state, "Already in Archive");
+        return;
     }
+    // Queued like any other change, so it reaches the server and survives
+    // being made offline.
+    match apply_op(state, Op::Move { message_id: detail.summary.id.clone(), folder_id: archive }) {
+        Ok(()) => {
+            show_message(state, None);
+            toast(state, "Moved to Archive");
+        }
+        Err(e) => toast(state, &e.to_string()),
+    }
+    reload_messages(state);
+    reload_folders(state, false);
+    render_status(state);
 }
 
 fn toggle_read_current(state: &Rc<State>) {

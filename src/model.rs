@@ -117,6 +117,11 @@ pub enum Op {
         #[serde(default)]
         purge: bool,
     },
+    Move {
+        message_id: String,
+        /// Destination folder id.
+        folder_id: String,
+    },
     Send {
         local_id: String,
         message: Outgoing,
@@ -129,6 +134,7 @@ impl Op {
             Op::MarkRead { .. } => "mark_read",
             Op::Delete { purge: true, .. } => "purge",
             Op::Delete { .. } => "delete",
+            Op::Move { .. } => "move",
             Op::Send { .. } => "send",
         }
     }

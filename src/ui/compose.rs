@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::model::{MessageDetail, Op, Outgoing, SendMode};
+use crate::ui::widgets::{EntryRow, ToolbarView};
 use crate::ui::window::{self, State};
 
 pub struct ComposeWindow;
@@ -34,7 +35,7 @@ impl ComposeWindow {
             .title(title)
             .build();
 
-        let view = adw::ToolbarView::new();
+        let view = ToolbarView::new();
         let header = adw::HeaderBar::new();
         let send_button = gtk::Button::with_label("Send");
         send_button.add_css_class("suggested-action");
@@ -53,9 +54,9 @@ impl ComposeWindow {
         let fields = gtk::ListBox::new();
         fields.set_selection_mode(gtk::SelectionMode::None);
         fields.add_css_class("boxed-list");
-        let to_row = adw::EntryRow::builder().title("To").build();
-        let cc_row = adw::EntryRow::builder().title("Cc").build();
-        let subject_row = adw::EntryRow::builder().title("Subject").build();
+        let to_row = EntryRow::new("To");
+        let cc_row = EntryRow::new("Cc");
+        let subject_row = EntryRow::new("Subject");
 
         if let Some(original) = &original {
             let subject = original.summary.subject.clone();
@@ -89,9 +90,9 @@ impl ComposeWindow {
             subject_row.set_text(&if already { subject } else { format!("{prefix}{subject}") });
             subject_row.set_sensitive(false);
         }
-        fields.append(&to_row);
-        fields.append(&cc_row);
-        fields.append(&subject_row);
+        fields.append(to_row.row());
+        fields.append(cc_row.row());
+        fields.append(subject_row.row());
         content.append(&fields);
 
         let body_view = gtk::TextView::builder()
@@ -109,7 +110,7 @@ impl ComposeWindow {
         content.append(&error_label);
 
         view.set_content(Some(&content));
-        window.set_content(Some(&view));
+        window.set_content(Some(view.widget()));
 
         let original_id = original.as_ref().map(|d| d.summary.id.clone());
         let state = state.clone();

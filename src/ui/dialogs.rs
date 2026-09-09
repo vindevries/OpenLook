@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gdk, glib};
 
 use crate::auth::DeviceFlow;
 use crate::config::{Settings, DEFAULT_CLIENT_ID};
 use crate::model::AccountInfo;
+use crate::ui::widgets::{EntryRow, ToolbarView};
 use crate::ui::window::{self, State};
 
 /// Outlook-style account setup: a plain "Sign in" button, with the app
@@ -24,7 +25,7 @@ pub fn show_account_dialog(state: &Rc<State>, first_run: bool) {
         .default_height(600)
         .build();
 
-    let view = adw::ToolbarView::new();
+    let view = ToolbarView::new();
     view.add_top_bar(&adw::HeaderBar::new());
     let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
 
@@ -88,13 +89,12 @@ pub fn show_account_dialog(state: &Rc<State>, first_run: bool) {
              If your organization blocks it, use your own app registration.",
         )
         .build();
-    let client_id_row = adw::EntryRow::builder().title("Application (client) ID").build();
+    let client_id_row = EntryRow::new("Application (client) ID");
     client_id_row.set_text(&settings.client_id);
-    let tenant_row =
-        adw::EntryRow::builder().title("Tenant (organizations, consumers, or tenant ID)").build();
+    let tenant_row = EntryRow::new("Tenant (organizations, consumers, or tenant ID)");
     tenant_row.set_text(&settings.tenant);
-    expander.add_row(&client_id_row);
-    expander.add_row(&tenant_row);
+    expander.add_row(client_id_row.row());
+    expander.add_row(tenant_row.row());
     advanced_list.append(&expander);
     setup.append(&advanced_list);
     stack.add_named(&setup, Some("setup"));
@@ -139,7 +139,7 @@ pub fn show_account_dialog(state: &Rc<State>, first_run: bool) {
     stack.add_named(&code_page, Some("code"));
 
     view.set_content(Some(&stack));
-    dialog.set_content(Some(&view));
+    dialog.set_content(Some(view.widget()));
 
     // ---- behaviour ------------------------------------------------------
     let cancel = Arc::new(AtomicBool::new(false));
@@ -196,7 +196,10 @@ pub fn show_account_dialog(state: &Rc<State>, first_run: bool) {
         open_button.connect_clicked(move |_| {
             let uri = flow_uri.borrow().clone();
             let uri = if uri.is_empty() { "https://microsoft.com/devicelogin".to_string() } else { uri };
-            gtk::UriLauncher::new(&uri).launch(Some(&dialog), gio::Cancellable::NONE, |_| {});
+            // gtk::UriLauncher would be tidier but needs GTK 4.10; this works
+            // back to 4.6 (Ubuntu 22.04).
+            #[allow(deprecated)]
+            gtk::show_uri(Some(&dialog), &uri, gdk::CURRENT_TIME);
         });
     }
 
@@ -344,13 +347,12 @@ pub fn show_settings(state: &Rc<State>) {
              restore the default.",
         )
         .build();
-    let client_id_row = adw::EntryRow::builder().title("Application (client) ID").build();
+    let client_id_row = EntryRow::new("Application (client) ID");
     client_id_row.set_text(&settings.client_id);
-    let tenant_row =
-        adw::EntryRow::builder().title("Tenant (organizations, consumers, or tenant ID)").build();
+    let tenant_row = EntryRow::new("Tenant (organizations, consumers, or tenant ID)");
     tenant_row.set_text(&settings.tenant);
-    group.add(&client_id_row);
-    group.add(&tenant_row);
+    group.add(client_id_row.row());
+    group.add(tenant_row.row());
     page.add(&group);
 
     let cache_group = adw::PreferencesGroup::builder()
@@ -379,13 +381,15 @@ pub fn show_settings(state: &Rc<State>) {
 }
 
 pub fn show_about(state: &Rc<State>) {
-    adw::AboutWindow::builder()
+    // adw::AboutWindow needs libadwaita 1.2; this is the 1.1-era equivalent.
+    gtk::AboutDialog::builder()
         .transient_for(&state.window)
-        .application_name("OpenLook")
-        .application_icon("openlook")
+        .modal(true)
+        .program_name("OpenLook")
+        .logo_icon_name("openlook")
         .version(env!("CARGO_PKG_VERSION"))
         .comments("An Outlook-style native mail client for Linux, with offline mail.")
-        .developer_name("Vincent")
+        .authors(vec!["Vincent".to_string()])
         .license_type(gtk::License::Agpl30)
         .build()
         .present();
