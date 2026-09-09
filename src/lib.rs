@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod demo;
 pub mod graph;
+pub mod hubspot;
 pub mod model;
 pub mod sync;
 pub mod ui;
