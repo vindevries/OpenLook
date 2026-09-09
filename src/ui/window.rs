@@ -1470,6 +1470,7 @@ fn toggle_read_current(state: &Rc<State>) {
 
 /// Add a freshly signed-in mailbox without disturbing the others.
 pub fn add_account(state: &Rc<State>, account: AccountInfo) {
+    let username = account.username.clone();
     let session =
         match Session::new(Mode::Account(account), state.auth.clone(), state.http.clone()) {
             Ok(session) => session,
@@ -1478,6 +1479,32 @@ pub fn add_account(state: &Rc<State>, account: AccountInfo) {
                 return;
             }
         };
+
+    // Signing in again with a mailbox that is already open — to grant a new
+    // permission, say — replaces it. Pushing would list the same mailbox
+    // twice and run two sync engines against one cache.
+    let existing = state
+        .sessions
+        .borrow()
+        .iter()
+        .position(|s| s.account().map(|a| a.username == username).unwrap_or(false));
+    if let Some(index) = existing {
+        // Dropping the old session closes its command channel, which stops
+        // its engine and ends the listener spawned for that slot.
+        state.sessions.borrow_mut()[index] = session;
+        if let Some(slot) = state.statuses.borrow_mut().get_mut(index) {
+            *slot = Status::default();
+        }
+        listen(state, index);
+        if let Some(session) = state.sessions.borrow().get(index) {
+            session.send(Cmd::SyncAll(None));
+        }
+        reload_folders(state, false);
+        render_status(state);
+        toast(state, &format!("Reconnected {username}"));
+        return;
+    }
+
     // The demo mailbox steps aside as soon as a real one is connected.
     let replacing_demo = state.sessions.borrow().iter().all(Session::is_demo);
     if replacing_demo {
@@ -1495,6 +1522,7 @@ pub fn add_account(state: &Rc<State>, account: AccountInfo) {
     }
     reload_folders(state, true);
     render_status(state);
+    toast(state, &format!("Added {username}"));
 }
 
 /// Drop the mailbox whose folder is currently selected.

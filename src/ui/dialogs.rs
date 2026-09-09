@@ -285,8 +285,8 @@ pub fn show_account_dialog(state: &Rc<State>, first_run: bool) {
                     settings.demo_ack = false;
                     let _ = settings.save();
                     let username = account.username.clone();
+                    let _ = username;
                     window::add_account(&state, account);
-                    window::toast(&state, &format!("Added {username}"));
                     dialog.close();
                 }
                 Err(message) => {
