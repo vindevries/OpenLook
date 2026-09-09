@@ -164,6 +164,14 @@ impl Db {
         Ok(())
     }
 
+    /// Order a folder explicitly. Ticket stages run New → … → Closed,
+    /// which is nothing like the well-known-mail-folder ranking.
+    pub fn set_folder_sort(&self, folder_id: &str, order: i64) -> Result<()> {
+        self.conn()
+            .execute("UPDATE folders SET sort_order = ?2 WHERE id = ?1", params![folder_id, order])?;
+        Ok(())
+    }
+
     pub fn folder_id_by_name(&self, name: &str) -> Option<String> {
         self.conn()
             .query_row("SELECT id FROM folders WHERE display_name = ?1", params![name], |r| r.get(0))

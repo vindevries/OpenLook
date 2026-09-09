@@ -60,6 +60,14 @@ impl EntryRow {
         self.entry.text()
     }
 
+    /// Mask the contents, for keys and other secrets.
+    pub fn set_secret(&self, secret: bool) {
+        self.entry.set_visibility(!secret);
+        if secret {
+            self.entry.set_input_purpose(gtk::InputPurpose::Password);
+        }
+    }
+
     pub fn set_text(&self, text: &str) {
         self.entry.set_text(text);
     }

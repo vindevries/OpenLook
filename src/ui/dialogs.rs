@@ -394,3 +394,184 @@ pub fn show_about(state: &Rc<State>) {
         .build()
         .present();
 }
+
+/// Connect HubSpot: paste a private-app key, then pick which ticket
+/// pipelines become sections in the ticket pane.
+pub fn show_hubspot_dialog(state: &Rc<State>) {
+    let dialog = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title("Add tickets")
+        .default_width(560)
+        .default_height(560)
+        .build();
+
+    let view = ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(20)
+        .margin_bottom(20)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+
+    let icon = gtk::Image::from_icon_name("view-list-symbolic");
+    icon.set_pixel_size(48);
+    icon.add_css_class("dim-label");
+    let title = gtk::Label::new(Some("Connect HubSpot"));
+    title.add_css_class("title-1");
+    let subtitle = gtk::Label::builder()
+        .label(
+            "Paste a private app key. In HubSpot: Settings → Integrations → Private Apps, \
+             with the scopes tickets, crm.objects.contacts.read and conversations.read.",
+        )
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    subtitle.add_css_class("dim-label");
+    content.append(&icon);
+    content.append(&title);
+    content.append(&subtitle);
+
+    let fields = gtk::ListBox::new();
+    fields.set_selection_mode(gtk::SelectionMode::None);
+    fields.add_css_class("boxed-list");
+    let key_row = EntryRow::new("Private app key");
+    // A long-lived secret; no reason to display it while typing.
+    key_row.set_secret(true);
+    fields.append(key_row.row());
+    content.append(&fields);
+
+    let connect = gtk::Button::with_label("Connect");
+    connect.add_css_class("suggested-action");
+    connect.add_css_class("pill");
+    connect.set_halign(gtk::Align::Center);
+    content.append(&connect);
+
+    let status = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).build();
+    status.add_css_class("dim-label");
+    content.append(&status);
+
+    // Pipelines appear here once the key checks out.
+    let pipeline_list = gtk::ListBox::new();
+    pipeline_list.set_selection_mode(gtk::SelectionMode::None);
+    pipeline_list.add_css_class("boxed-list");
+    pipeline_list.set_visible(false);
+    content.append(&pipeline_list);
+
+    let add = gtk::Button::with_label("Add selected pipelines");
+    add.add_css_class("suggested-action");
+    add.set_halign(gtk::Align::Center);
+    add.set_visible(false);
+    content.append(&add);
+
+    view.set_content(Some(&content));
+    dialog.set_content(Some(view.widget()));
+
+    // Checkboxes are collected here so the Add button can read them.
+    let chosen: Rc<RefCell<Vec<(String, String, gtk::CheckButton)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+
+    {
+        let state = state.clone();
+        let status = status.clone();
+        let key_row = key_row.clone();
+        let pipeline_list = pipeline_list.clone();
+        let add = add.clone();
+        let chosen = chosen.clone();
+        connect.connect_clicked(move |button| {
+            let key = key_row.text().trim().to_string();
+            if key.is_empty() {
+                status.set_text("Paste the private app key first.");
+                return;
+            }
+            // Store it the way the Microsoft tokens are stored, not in
+            // settings.json: it is a long-lived secret.
+            if let Err(e) = crate::config::save_hubspot_token(&key) {
+                status.set_text(&format!("Could not save the key: {e}"));
+                return;
+            }
+            button.set_sensitive(false);
+            status.set_text("Checking the key…");
+
+            let (tx, rx) = async_channel::bounded::<Result<Vec<(String, String)>, String>>(1);
+            let http = state.http.clone();
+            window::rt().spawn(async move {
+                let client = crate::hubspot::HubSpot::new(http, key);
+                let result = client.pipelines().await.map_err(|e| e.to_string());
+                let _ = tx.send(result).await;
+            });
+
+            let status = status.clone();
+            let pipeline_list = pipeline_list.clone();
+            let add = add.clone();
+            let chosen = chosen.clone();
+            let button = button.clone();
+            glib::spawn_future_local(async move {
+                let Ok(result) = rx.recv().await else { return };
+                button.set_sensitive(true);
+                match result {
+                    Ok(pipelines) => {
+                        let already = crate::config::Settings::load().hubspot_pipelines;
+                        chosen.borrow_mut().clear();
+                        while let Some(row) = pipeline_list.row_at_index(0) {
+                            pipeline_list.remove(&row);
+                        }
+                        for (id, label) in pipelines {
+                            let row = gtk::ListBoxRow::new();
+                            row.set_selectable(false);
+                            let row_box = gtk::Box::builder()
+                                .spacing(10)
+                                .margin_top(8)
+                                .margin_bottom(8)
+                                .margin_start(12)
+                                .margin_end(12)
+                                .build();
+                            let check = gtk::CheckButton::new();
+                            check.set_active(already.iter().any(|p| p.id == id));
+                            row_box.append(&check);
+                            row_box.append(&gtk::Label::new(Some(&label)));
+                            row.set_child(Some(&row_box));
+                            pipeline_list.append(&row);
+                            chosen.borrow_mut().push((id, label, check));
+                        }
+                        status.set_text("Choose the pipelines to show as folders.");
+                        pipeline_list.set_visible(true);
+                        add.set_visible(true);
+                    }
+                    Err(message) => {
+                        status.set_text(&message);
+                        status.remove_css_class("dim-label");
+                        status.add_css_class("error");
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let state = state.clone();
+        let dialog = dialog.clone();
+        let chosen = chosen.clone();
+        add.connect_clicked(move |_| {
+            let picked: Vec<crate::config::PipelineRef> = chosen
+                .borrow()
+                .iter()
+                .filter(|(_, _, check)| check.is_active())
+                .map(|(id, label, _)| crate::config::PipelineRef {
+                    id: id.clone(),
+                    label: label.clone(),
+                })
+                .collect();
+            let mut settings = Settings::load();
+            settings.hubspot_pipelines = picked.clone();
+            let _ = settings.save();
+            window::add_ticket_pipelines(&state, &picked);
+            dialog.close();
+        });
+    }
+
+    dialog.present();
+}

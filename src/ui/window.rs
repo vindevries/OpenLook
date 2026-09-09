@@ -43,6 +43,14 @@ fn folder_icon(name: &str) -> &'static str {
     }
 }
 
+/// Which kind of mailbox the panes are showing. Tickets get their own
+/// pane rather than sitting among the mail folders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Mail,
+    Tickets,
+}
+
 /// One row of the folder pane.
 #[derive(Clone)]
 enum PaneRow {
@@ -134,12 +142,30 @@ pub struct State {
     collapsed: RefCell<HashSet<String>>,
     current: RefCell<Option<(usize, String)>>,
     current_message: RefCell<Option<String>>,
+    scope: Cell<Scope>,
+    /// Selection is remembered per scope, so switching panes returns you
+    /// to where you were.
+    mail_selection: RefCell<Option<(usize, String)>>,
+    ticket_selection: RefCell<Option<(usize, String)>>,
     unread_only: Cell<bool>,
     newest_first: Cell<bool>,
     rebuilding: Cell<bool>,
 }
 
 impl State {
+    pub fn scope(&self) -> Scope {
+        self.scope.get()
+    }
+
+    /// Whether a session belongs in the pane currently on show.
+    fn in_scope(&self, index: usize) -> bool {
+        let tickets = self.sessions.borrow().get(index).map(Session::is_tickets).unwrap_or(false);
+        match self.scope.get() {
+            Scope::Mail => !tickets,
+            Scope::Tickets => tickets,
+        }
+    }
+
     /// Index of the mailbox whose folder is open (falls back to the first).
     pub fn active_session(&self) -> usize {
         self.current.borrow().as_ref().map(|(index, _)| *index).unwrap_or(0)
@@ -534,8 +560,15 @@ pub fn build(app: &adw::Application) {
         .build();
     calendar_button.add_css_class("flat");
     calendar_button.set_group(Some(&mail_button));
+    let tickets_button = gtk::ToggleButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Tickets")
+        .build();
+    tickets_button.add_css_class("flat");
+    tickets_button.set_group(Some(&mail_button));
     rail.append(&mail_button);
     rail.append(&calendar_button);
+    rail.append(&tickets_button);
 
     let shell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     shell.append(&rail);
@@ -586,6 +619,9 @@ pub fn build(app: &adw::Application) {
         collapsed: RefCell::new(HashSet::new()),
         current: RefCell::new(None),
         current_message: RefCell::new(None),
+        scope: Cell::new(Scope::Mail),
+        mail_selection: RefCell::new(None),
+        ticket_selection: RefCell::new(None),
         unread_only: Cell::new(false),
         newest_first: Cell::new(true),
         rebuilding: Cell::new(false),
@@ -601,9 +637,25 @@ pub fn build(app: &adw::Application) {
                 command_bar.set_visible(false);
                 crate::ui::calendar::refresh(&s);
                 crate::ui::calendar::request_sync(&s);
-            } else {
+            } else if !s.view_stack.visible_child_name().is_some_and(|n| n == "mail") {
+                // Leaving the calendar for whichever list pane is selected.
                 s.view_stack.set_visible_child_name("mail");
                 command_bar.set_visible(true);
+            }
+        });
+    }
+    {
+        // Tickets reuse the three panes, showing the ticket sessions only.
+        let s = state.clone();
+        tickets_button.connect_toggled(move |button| {
+            set_scope(&s, if button.is_active() { Scope::Tickets } else { Scope::Mail });
+        });
+    }
+    {
+        let s = state.clone();
+        mail_button.connect_toggled(move |button| {
+            if button.is_active() {
+                set_scope(&s, Scope::Mail);
             }
         });
     }
@@ -736,7 +788,11 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         ("delete", Box::new(delete_current)),
         ("archive", Box::new(archive_current)),
         ("toggle-read", Box::new(toggle_read_current)),
-        ("sign-in", Box::new(|s: &Rc<State>| dialogs::show_account_dialog(s, false))),
+        ("sign-in", Box::new(|s: &Rc<State>| match s.scope() {
+            // In the ticket pane, "add" means connecting HubSpot.
+            Scope::Tickets => dialogs::show_hubspot_dialog(s),
+            Scope::Mail => dialogs::show_account_dialog(s, false),
+        })),
         ("sign-out", Box::new(dialogs::sign_out)),
     ];
     for (name, handler) in actions {
@@ -789,6 +845,32 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
             true
         });
     }
+}
+
+/// Switch between the mail and ticket panes, keeping each one's selection.
+pub fn set_scope(state: &Rc<State>, scope: Scope) {
+    if state.scope.get() == scope {
+        return;
+    }
+    // Park the current selection so returning here lands in the same place.
+    let current = state.current.borrow().clone();
+    match state.scope.get() {
+        Scope::Mail => *state.mail_selection.borrow_mut() = current,
+        Scope::Tickets => *state.ticket_selection.borrow_mut() = current,
+    }
+    state.scope.set(scope);
+    let restored = match scope {
+        Scope::Mail => state.mail_selection.borrow().clone(),
+        Scope::Tickets => state.ticket_selection.borrow().clone(),
+    };
+    *state.current.borrow_mut() = restored.clone();
+    *state.current_message.borrow_mut() = None;
+    show_message(state, None);
+    state.view_stack.set_visible_child_name("mail");
+
+    reload_folders(state, restored.is_none());
+    reload_messages(state);
+    render_status(state);
 }
 
 /// Pump one mailbox's sync events into the UI.
@@ -858,17 +940,30 @@ fn watch_network(state: &Rc<State>) {
 
 pub fn reload_folders(state: &Rc<State>, select_default: bool) {
     let mut rows: Vec<PaneRow> = Vec::new();
+    // Only the sessions belonging to the pane on show; tickets and mail
+    // never appear in the same tree.
     let per_session: Vec<Vec<Folder>> = state
         .sessions
         .borrow()
         .iter()
-        .map(|session| session.db.folders().unwrap_or_default())
+        .enumerate()
+        .map(|(index, session)| {
+            if state.in_scope(index) {
+                session.db.folders().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
         .collect();
-    let multiple = per_session.len() > 1;
+    let tickets_pane = matches!(state.scope.get(), Scope::Tickets);
+    let visible = per_session.iter().filter(|f| !f.is_empty()).count();
+    let multiple = visible > 1;
 
     // Favorites: the usual four for a single mailbox, each inbox when several.
-    rows.push(PaneRow::Header { key: "fav".into(), title: "Favorites".into() });
-    if !state.collapsed.borrow().contains("fav") {
+    if !tickets_pane {
+        rows.push(PaneRow::Header { key: "fav".into(), title: "Favorites".into() });
+    }
+    if !tickets_pane && !state.collapsed.borrow().contains("fav") {
         for (index, folders) in per_session.iter().enumerate() {
             if multiple {
                 if let Some(inbox) = folders.iter().find(|f| f.display_name == "Inbox") {
@@ -894,6 +989,9 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
 
     // One section per mailbox.
     for (index, folders) in per_session.iter().enumerate() {
+        if !state.in_scope(index) {
+            continue;
+        }
         let key = format!("account:{index}");
         let title = state
             .sessions
@@ -950,7 +1048,7 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                 {
                     select_index = Some(index as i32);
                 }
-                folder_row(state, *session, folder)
+                folder_row(state, *session, folder, tickets_pane)
             }
             PaneRow::Notice { text, error } => pane_notice_row(text, *error),
         };
@@ -1014,7 +1112,12 @@ fn pane_notice_row(text: &str, error: bool) -> gtk::ListBoxRow {
     row
 }
 
-fn folder_row(state: &Rc<State>, session: usize, folder: &Folder) -> gtk::ListBoxRow {
+fn folder_row(
+    state: &Rc<State>,
+    session: usize,
+    folder: &Folder,
+    tickets: bool,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
 
     let target = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
@@ -1062,6 +1165,17 @@ fn folder_row(state: &Rc<State>, session: usize, folder: &Folder) -> gtk::ListBo
         .ellipsize(EllipsizeMode::End)
         .build();
     row_box.append(&name);
+
+    // A stage shows how many tickets sit in it; unread has no meaning here.
+    if tickets {
+        if folder.total_count > 0 {
+            let badge = gtk::Label::new(Some(&folder.total_count.to_string()));
+            badge.add_css_class("count-muted");
+            row_box.append(&badge);
+        }
+        row.set_child(Some(&row_box));
+        return row;
+    }
 
     let bracketed = BRACKET_COUNT.contains(&folder.display_name.as_str());
     if bracketed && folder.total_count > 0 {
@@ -1545,6 +1659,37 @@ pub fn add_account(state: &Rc<State>, account: AccountInfo) {
     reload_folders(state, true);
     render_status(state);
     toast(state, &format!("Added {username}"));
+}
+
+/// Open sessions for the ticket pipelines just chosen, replacing any that
+/// are already open so re-adding does not duplicate them.
+pub fn add_ticket_pipelines(state: &Rc<State>, pipelines: &[crate::config::PipelineRef]) {
+    state.sessions.borrow_mut().retain(|s| !s.is_tickets());
+    let keep = state.sessions.borrow().len();
+    state.statuses.borrow_mut().truncate(keep);
+    *state.ticket_selection.borrow_mut() = None;
+
+    for pipeline in pipelines {
+        let mode = Mode::Tickets {
+            pipeline_id: pipeline.id.clone(),
+            pipeline_label: pipeline.label.clone(),
+        };
+        match Session::new(mode, state.auth.clone(), state.http.clone()) {
+            Ok(session) => {
+                state.sessions.borrow_mut().push(session);
+                state.statuses.borrow_mut().push(Status::default());
+                let index = state.sessions.borrow().len() - 1;
+                listen(state, index);
+                if let Some(session) = state.sessions.borrow().get(index) {
+                    session.send(Cmd::SyncAll(None));
+                }
+            }
+            Err(e) => toast(state, &format!("Could not open {}: {e}", pipeline.label)),
+        }
+    }
+    set_scope(state, Scope::Tickets);
+    reload_folders(state, true);
+    toast(state, &format!("Added {} ticket pipeline(s)", pipelines.len()));
 }
 
 /// Drop the mailbox whose folder is currently selected.

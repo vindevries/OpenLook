@@ -380,6 +380,11 @@ impl Engine {
                 })
                 .collect();
             if self.db.upsert_folders(&folders).is_ok() {
+                // Keep HubSpot's own stage sequence: New … Closed, not the
+                // alphabetical order the mail ranking falls back to.
+                for (position, stage) in stages.iter().enumerate() {
+                    let _ = self.db.set_folder_sort(&stage.id, position as i64);
+                }
                 self.emit(Event::FoldersChanged);
             }
         }

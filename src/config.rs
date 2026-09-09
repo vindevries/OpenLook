@@ -101,6 +101,17 @@ pub fn hubspot_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Write the HubSpot key, readable only by its owner.
+pub fn save_hubspot_token(token: &str) -> Result<()> {
+    let path = hubspot_token_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, token.trim())?;
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+
 pub fn tokens_path() -> PathBuf {
     config_dir().join("tokens.json")
 }
