@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::graph::folder_rank;
 use crate::model::{
-    Address, Body, CalendarEvent, Folder, MessageDetail, MessageSummary, Op, Pending,
+    Address, Body, CalendarEvent, Folder, MessageDetail, MessagePatch, MessageSummary, Op, Pending,
 };
 use crate::util::now_unix;
 
@@ -87,6 +87,16 @@ impl Db {
         ] {
             let _ = conn.execute(statement, []);
         }
+        // Partial delta entries used to be stored as whole messages, which
+        // left rows behind with no date, sender or subject. Drop them and
+        // let the folders that held them enumerate again, which refetches
+        // the real messages.
+        let _ = conn.execute(
+            "UPDATE folders SET delta_link = NULL
+              WHERE id IN (SELECT folder_id FROM messages WHERE received = '' AND pending = 0)",
+            [],
+        );
+        let _ = conn.execute("DELETE FROM messages WHERE received = '' AND pending = 0", []);
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -315,6 +325,65 @@ impl Db {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply delta entries that carried only the properties that changed:
+    /// write those, leave the rest of the cached row alone. A message that
+    /// is not cached is skipped — a fields-only entry cannot make a usable
+    /// row, and the next enumeration brings the whole message.
+    pub fn patch_messages(&self, patches: &[MessagePatch]) -> Result<()> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        let pending = self.pending_message_ids()?;
+        for patch in patches {
+            if pending.contains(&patch.id) {
+                continue;
+            }
+            let cached: Option<String> = self
+                .conn()
+                .query_row(
+                    "SELECT folder_id FROM messages WHERE id = ?1",
+                    params![patch.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(folder_id) = cached else { continue };
+            // Moves and read changes go through the same paths as local
+            // edits, so the folder badges stay in step either way.
+            if let Some(target) = &patch.folder_id {
+                if *target != folder_id {
+                    self.move_message(&patch.id, target)?;
+                }
+            }
+            if let Some(is_read) = patch.is_read {
+                self.set_read(&patch.id, is_read)?;
+            }
+            let (from_name, from_addr) = match &patch.from {
+                Some(from) => (Some(&from.name), Some(&from.address)),
+                None => (None, None),
+            };
+            self.conn().execute(
+                "UPDATE messages SET
+                     subject         = COALESCE(?2, subject),
+                     from_name       = COALESCE(?3, from_name),
+                     from_addr       = COALESCE(?4, from_addr),
+                     received        = COALESCE(?5, received),
+                     preview         = COALESCE(?6, preview),
+                     has_attachments = COALESCE(?7, has_attachments)
+                  WHERE id = ?1",
+                params![
+                    patch.id,
+                    patch.subject,
+                    from_name,
+                    from_addr,
+                    patch.received,
+                    patch.preview,
+                    patch.has_attachments.map(|v| v as i64),
+                ],
+            )?;
+        }
         Ok(())
     }
 

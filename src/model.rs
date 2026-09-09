@@ -62,6 +62,22 @@ pub struct MessageSummary {
     pub pending: Pending,
 }
 
+/// The properties one delta entry actually carried. Once Graph has reported
+/// a message, later entries for it hold only what changed — an `isRead` and
+/// little else — so anything absent here has to be left as the cache already
+/// has it rather than overwritten with a default.
+#[derive(Debug, Clone, Default)]
+pub struct MessagePatch {
+    pub id: String,
+    pub folder_id: Option<String>,
+    pub subject: Option<String>,
+    pub from: Option<Address>,
+    pub received: Option<String>,
+    pub preview: Option<String>,
+    pub is_read: Option<bool>,
+    pub has_attachments: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageDetail {
     pub summary: MessageSummary,
