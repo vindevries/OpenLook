@@ -164,6 +164,21 @@ pub fn build(app: &adw::Application) {
             Err(e) => eprintln!("openlook: cannot open cache for {}: {e}", account.username),
         }
     }
+    // HubSpot ticket pipelines sit alongside the mailboxes, each as its
+    // own section, and only when a token has been provided.
+    if crate::config::hubspot_token().is_some() {
+        for pipeline in crate::config::Settings::load().hubspot_pipelines {
+            let mode = Mode::Tickets {
+                pipeline_id: pipeline.id.clone(),
+                pipeline_label: pipeline.label.clone(),
+            };
+            match Session::new(mode, auth.clone(), http.clone()) {
+                Ok(session) => sessions.push(session),
+                Err(e) => eprintln!("openlook: cannot open cache for {}: {e}", pipeline.label),
+            }
+        }
+    }
+
     if sessions.is_empty() {
         match Session::new(Mode::Demo, auth.clone(), http.clone()) {
             Ok(session) => sessions.push(session),

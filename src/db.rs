@@ -84,6 +84,7 @@ impl Db {
         for statement in [
             "ALTER TABLE events ADD COLUMN body TEXT",
             "ALTER TABLE events ADD COLUMN attendees TEXT",
+            "ALTER TABLE messages ADD COLUMN thread_ids TEXT",
         ] {
             let _ = conn.execute(statement, []);
         }
@@ -535,6 +536,28 @@ impl Db {
         conn.execute(
             "UPDATE outbox SET message_id = ?2 WHERE message_id = ?1",
             params![old_id, new_id],
+        )?;
+        Ok(())
+    }
+
+    /// Conversation threads behind a ticket row, newest last.
+    pub fn thread_ids(&self, id: &str) -> Vec<String> {
+        self.conn()
+            .query_row("SELECT thread_ids FROM messages WHERE id = ?1", params![id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_thread_ids(&self, id: &str, threads: &[String]) -> Result<()> {
+        self.conn().execute(
+            "UPDATE messages SET thread_ids = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(threads)?],
         )?;
         Ok(())
     }

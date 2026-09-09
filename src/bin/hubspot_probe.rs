@@ -144,5 +144,34 @@ async fn main() {
             }
         }
     }
+    // Assemble a real ticket the way the reading pane will, and report its
+    // shape only — never its text.
+    println!("\n== assembling a real ticket for the reading pane ==");
+    let mut assembled = false;
+    for ticket in tickets.iter().take(15) {
+        let Ok(threads) = hs.ticket_threads(&ticket.id).await else { continue };
+        if threads.is_empty() {
+            continue;
+        }
+        let mut collected = Vec::new();
+        for thread in &threads {
+            if let Ok(messages) = hs.thread_messages(thread).await {
+                collected.push((thread.clone(), messages));
+            }
+        }
+        let total: usize = collected.iter().map(|(_, m)| m.len()).sum();
+        let html = openlook::hubspot::assemble_ticket_html("", &collected);
+        println!("  ticket with {} thread(s), {total} message(s)", collected.len());
+        println!("    document: {} bytes", html.len());
+        println!("    message blocks rendered: {}", html.matches("ol-block").count());
+        println!("    thread labels: {}", html.matches("ol-thread").count());
+        println!("    outgoing/incoming markers: {}/{}", html.matches("&rarr;").count(), html.matches("&larr;").count());
+        assembled = true;
+        break;
+    }
+    if !assembled {
+        println!("  no ticket with a thread found in the sample");
+    }
+
     println!("\nread-only probe finished; nothing was sent or modified.");
 }

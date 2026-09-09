@@ -66,6 +66,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub id: String,
+    pub pipeline_id: String,
     pub label: String,
     pub display_order: i64,
     pub closed: bool,
@@ -81,6 +82,8 @@ pub struct Ticket {
     pub stage_id: String,
     pub created: String,
     pub updated: String,
+    /// How the ticket reached HubSpot, e.g. EMAIL or FORM.
+    pub source: String,
     pub contact_ids: Vec<String>,
     pub thread_ids: Vec<String>,
 }
@@ -157,6 +160,29 @@ impl HubSpot {
         })
     }
 
+    /// Pipelines, for the settings list.
+    pub async fn pipelines(&self) -> Result<Vec<(String, String)>> {
+        let data = self.get("/crm/v3/pipelines/tickets").await?;
+        Ok(data["results"]
+            .as_array()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|p| {
+                (
+                    p["id"].as_str().unwrap_or_default().to_string(),
+                    p["label"].as_str().unwrap_or("(pipeline)").to_string(),
+                )
+            })
+            .collect())
+    }
+
+    /// Stages of one pipeline. Labels repeat across pipelines, so a stage
+    /// list is only meaningful scoped to its own.
+    pub async fn stages_of(&self, pipeline_id: &str) -> Result<Vec<Stage>> {
+        Ok(self.stages().await?.into_iter().filter(|s| s.pipeline_id == pipeline_id).collect())
+    }
+
     /// Ticket pipeline stages, which become the folder list.
     pub async fn stages(&self) -> Result<Vec<Stage>> {
         let data = self.get("/crm/v3/pipelines/tickets").await?;
@@ -165,6 +191,7 @@ impl HubSpot {
             for stage in pipeline["stages"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
                 stages.push(Stage {
                     id: stage["id"].as_str().unwrap_or_default().to_string(),
+                    pipeline_id: pipeline["id"].as_str().unwrap_or_default().to_string(),
                     label: stage["label"].as_str().unwrap_or("(stage)").to_string(),
                     display_order: stage["displayOrder"].as_i64().unwrap_or(0),
                     closed: stage["metadata"]["isClosed"].as_str() == Some("true"),
@@ -194,12 +221,85 @@ impl HubSpot {
                 stage_id: props["hs_pipeline_stage"].as_str().unwrap_or_default().to_string(),
                 created: props["createdate"].as_str().unwrap_or_default().to_string(),
                 updated: props["hs_lastmodifieddate"].as_str().unwrap_or_default().to_string(),
+                source: props["source_type"].as_str().unwrap_or_default().to_string(),
                 contact_ids: ids_from_associations(&item["associations"]["contacts"]),
                 // Threads are not returned inline; fetched separately.
                 thread_ids: Vec::new(),
             });
         }
         Ok(tickets)
+    }
+
+    /// Every ticket in a pipeline, with its contact associations.
+    ///
+    /// The list endpoint is used rather than search because only it returns
+    /// associations; the pipeline filter is applied here instead.
+    pub async fn tickets_in_pipeline(&self, pipeline_id: &str, max_pages: usize) -> Result<Vec<Ticket>> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..max_pages {
+            let mut path = String::from(
+                "/crm/v3/objects/tickets?limit=100\
+                 &properties=subject,content,hs_pipeline,hs_pipeline_stage,createdate,hs_lastmodifieddate,source_type\
+                 &associations=contacts",
+            );
+            if let Some(cursor) = &after {
+                path.push_str(&format!("&after={cursor}"));
+            }
+            let data = self.get(&path).await?;
+            for item in data["results"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                let props = &item["properties"];
+                if props["hs_pipeline"].as_str().unwrap_or_default() != pipeline_id {
+                    continue;
+                }
+                out.push(Ticket {
+                    id: item["id"].as_str().unwrap_or_default().to_string(),
+                    subject: props["subject"].as_str().unwrap_or("(no subject)").to_string(),
+                    content: props["content"].as_str().unwrap_or_default().to_string(),
+                    stage_id: props["hs_pipeline_stage"].as_str().unwrap_or_default().to_string(),
+                    created: props["createdate"].as_str().unwrap_or_default().to_string(),
+                    updated: props["hs_lastmodifieddate"].as_str().unwrap_or_default().to_string(),
+                    source: props["source_type"].as_str().unwrap_or_default().to_string(),
+                    contact_ids: ids_from_associations(&item["associations"]["contacts"]),
+                    thread_ids: Vec::new(),
+                });
+            }
+            match data["paging"]["next"]["after"].as_str() {
+                Some(cursor) => after = Some(cursor.to_string()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Contacts in one request rather than one each.
+    pub async fn contacts_batch(&self, ids: &[String]) -> Result<Vec<Contact>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let payload = serde_json::json!({
+            "properties": ["email", "firstname", "lastname"],
+            "inputs": ids.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
+        });
+        let data = self.post("/crm/v3/objects/contacts/batch/read", &payload).await?;
+        Ok(data["results"]
+            .as_array()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|c| {
+                let props = &c["properties"];
+                let name = [props["firstname"].as_str().unwrap_or(""), props["lastname"].as_str().unwrap_or("")]
+                    .join(" ")
+                    .trim()
+                    .to_string();
+                Contact {
+                    id: c["id"].as_str().unwrap_or_default().to_string(),
+                    email: props["email"].as_str().unwrap_or_default().to_string(),
+                    name,
+                }
+            })
+            .collect())
     }
 
     /// Conversation threads associated with a ticket. A web-form ticket has
@@ -297,4 +397,106 @@ fn ids_from_associations(node: &Value) -> Vec<String> {
             r["id"].as_str().map(str::to_string).or_else(|| r["id"].as_i64().map(|n| n.to_string()))
         })
         .collect()
+}
+
+/// Build the reading-pane document for a ticket: its description when it
+/// has one, then each associated thread in turn. Threads stay labelled
+/// rather than being merged into one stream, because a ticket routinely
+/// has several and it matters which exchange a message belongs to.
+pub fn assemble_ticket_html(description: &str, threads: &[(String, Vec<ThreadMessage>)]) -> String {
+    let mut html = String::new();
+    let has_messages = threads.iter().any(|(_, m)| !m.is_empty());
+    if !description.trim().is_empty() {
+        html.push_str(&format!(
+            "<div class='ol-block'><div class='ol-head'>Ticket description</div>{}</div>",
+            description
+        ));
+    }
+    let labelled = threads.iter().filter(|(_, m)| !m.is_empty()).count() > 1;
+    let mut shown = 0;
+    for (_thread_id, messages) in threads.iter().filter(|(_, m)| !m.is_empty()) {
+        shown += 1;
+        if labelled {
+            let started = messages.first().map(|m| m.sent_at.as_str()).unwrap_or("");
+            html.push_str(&format!(
+                "<div class='ol-thread'>Thread {shown} · started {}</div>",
+                crate::util::escape_html(started)
+            ));
+        }
+        for m in messages {
+            let who = if m.sender.trim().is_empty() { &m.sender_email } else { &m.sender };
+            let attachments = if m.attachments.is_empty() {
+                String::new()
+            } else {
+                format!(" · {} attachment(s): {}", m.attachments.len(), m.attachments.join(", "))
+            };
+            html.push_str(&format!(
+                "<div class='ol-block'><div class='ol-head'>{} {} · {}{}</div>{}</div>",
+                if m.outgoing { "&rarr;" } else { "&larr;" },
+                crate::util::escape_html(who),
+                crate::util::escape_html(&m.sent_at),
+                crate::util::escape_html(&attachments),
+                if m.is_html {
+                    m.body.clone()
+                } else {
+                    format!("<pre>{}</pre>", crate::util::escape_html(&m.body))
+                }
+            ));
+        }
+    }
+    if !has_messages && description.trim().is_empty() {
+        html.push_str("<p>No correspondence on this ticket yet.</p>");
+    }
+    html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(sender: &str, outgoing: bool, body: &str) -> ThreadMessage {
+        ThreadMessage {
+            id: "m".into(),
+            sender: sender.into(),
+            sender_email: format!("{sender}@example.com"),
+            sent_at: "2026-09-09T10:00:00Z".into(),
+            body: body.into(),
+            is_html: true,
+            outgoing,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn several_threads_stay_labelled() {
+        let threads = vec![
+            ("t1".to_string(), vec![message("customer", false, "<p>first</p>")]),
+            ("t2".to_string(), vec![message("support", true, "<p>second</p>")]),
+        ];
+        let html = assemble_ticket_html("", &threads);
+        assert_eq!(html.matches("ol-thread").count(), 2, "each thread is labelled");
+        assert!(html.contains("first") && html.contains("second"));
+    }
+
+    #[test]
+    fn a_single_thread_needs_no_label() {
+        let threads = vec![("t1".to_string(), vec![message("customer", false, "<p>hello</p>")])];
+        let html = assemble_ticket_html("", &threads);
+        assert!(!html.contains("ol-thread"), "one thread reads as a plain conversation");
+        assert!(html.contains("hello"));
+    }
+
+    #[test]
+    fn a_web_form_ticket_shows_its_description() {
+        // No thread yet: the description is all there is to read.
+        let html = assemble_ticket_html("<p>printer on fire</p>", &[]);
+        assert!(html.contains("Ticket description"));
+        assert!(html.contains("printer on fire"));
+        assert!(!html.contains("No correspondence"));
+    }
+
+    #[test]
+    fn an_empty_ticket_says_so_rather_than_rendering_blank() {
+        assert!(assemble_ticket_html("", &[]).contains("No correspondence"));
+    }
 }

@@ -16,7 +16,8 @@ use crate::auth::Auth;
 use crate::config::{account_key, db_path};
 use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
-use crate::model::{AccountInfo, Body, MessageSummary, Op, Pending, Status};
+use crate::hubspot::HubSpot;
+use crate::model::{AccountInfo, Body, Folder, MessageSummary, Op, Pending, Status};
 use crate::util::now_unix;
 
 /// How many messages the first sync of a folder pulls down.
@@ -47,6 +48,8 @@ pub fn runtime() -> &'static Runtime {
 pub enum Mode {
     Demo,
     Account(AccountInfo),
+    /// A HubSpot ticket pipeline, shown as its own section of folders.
+    Tickets { pipeline_id: String, pipeline_label: String },
 }
 
 impl Mode {
@@ -54,6 +57,7 @@ impl Mode {
         match self {
             Mode::Demo => "demo".into(),
             Mode::Account(a) => account_key(&a.username),
+            Mode::Tickets { pipeline_id, .. } => format!("hubspot-{pipeline_id}"),
         }
     }
 
@@ -63,6 +67,7 @@ impl Mode {
             Mode::Demo => "demo mailbox".into(),
             Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
             Mode::Account(a) => a.name.clone(),
+            Mode::Tickets { pipeline_label, .. } => format!("HubSpot · {pipeline_label}"),
         }
     }
 }
@@ -112,15 +117,24 @@ impl Session {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Cmd>();
         let (event_tx, events) = async_channel::unbounded::<Event>();
 
-        let graph = match &mode {
-            Mode::Demo => None,
+        let backend = match &mode {
+            Mode::Demo => Backend::Demo,
             Mode::Account(account) => {
-                Some(Graph::new(http, auth, account.username.clone()))
+                Backend::Mail(Graph::new(http, auth, account.username.clone()))
             }
+            Mode::Tickets { pipeline_id, .. } => match crate::config::hubspot_token() {
+                Some(token) => Backend::Tickets {
+                    client: HubSpot::new(http, token),
+                    pipeline: pipeline_id.clone(),
+                },
+                // Without a token there is nothing to sync; the cache still
+                // serves whatever was fetched before.
+                None => Backend::Demo,
+            },
         };
         let engine = Engine {
             db: db.clone(),
-            graph,
+            backend,
             events: event_tx,
             status: Status::default(),
             last_folder: None,
@@ -141,8 +155,14 @@ impl Session {
     pub fn account(&self) -> Option<&AccountInfo> {
         match &self.mode {
             Mode::Account(a) => Some(a),
-            Mode::Demo => None,
+            Mode::Demo | Mode::Tickets { .. } => None,
         }
+    }
+
+    /// Ticket sessions have no mailbox behind them, so mail-only actions
+    /// (archive, reply-as-mail) do not apply.
+    pub fn is_tickets(&self) -> bool {
+        matches!(self.mode, Mode::Tickets { .. })
     }
 
     /// Label for this mailbox in the folder pane.
@@ -151,6 +171,7 @@ impl Session {
             Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
             Mode::Account(a) => a.name.clone(),
             Mode::Demo => "Demo mailbox".to_string(),
+            Mode::Tickets { pipeline_label, .. } => pipeline_label.clone(),
         }
     }
 
@@ -208,10 +229,26 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a session talks to. Demo talks to nothing: the cache is the world.
+enum Backend {
+    Demo,
+    Mail(Graph),
+    Tickets { client: HubSpot, pipeline: String },
+}
+
+impl Backend {
+    /// The Graph client, for the mail-only paths.
+    fn mail(&self) -> Option<Graph> {
+        match self {
+            Backend::Mail(graph) => Some(graph.clone()),
+            _ => None,
+        }
+    }
+}
+
 struct Engine {
     db: Db,
-    /// `None` in demo mode: everything stays local.
-    graph: Option<Graph>,
+    backend: Backend,
     events: async_channel::Sender<Event>,
     status: Status,
     last_folder: Option<String>,
@@ -262,7 +299,7 @@ impl Engine {
             }
             Cmd::SyncFolder(id) => {
                 self.last_folder = Some(id.clone());
-                if self.graph.is_some() {
+                if self.backend.mail().is_some() {
                     self.status.syncing = true;
                     self.publish_status();
                     self.sync_folder(&id).await;
@@ -318,8 +355,157 @@ impl Engine {
         }
     }
 
+    /// Stages become folders and tickets become rows, so the existing mail
+    /// panes show tickets without knowing anything about HubSpot.
+    async fn sync_tickets(&mut self) {
+        let Backend::Tickets { client, pipeline } = &self.backend else { return };
+        let (client, pipeline) = (client.clone(), pipeline.clone());
+        self.status.syncing = true;
+        self.publish_status();
+
+        let stages = client.stages_of(&pipeline).await;
+        self.note_hubspot(&stages);
+        if let Ok(stages) = stages {
+            let folders: Vec<Folder> = stages
+                .iter()
+                .map(|s| Folder {
+                    id: s.id.clone(),
+                    display_name: s.label.clone(),
+                    unread_count: 0,
+                    total_count: 0,
+                })
+                .collect();
+            if self.db.upsert_folders(&folders).is_ok() {
+                self.emit(Event::FoldersChanged);
+            }
+        }
+
+        let tickets = client.tickets_in_pipeline(&pipeline, 6).await;
+        self.note_hubspot(&tickets);
+        let Ok(tickets) = tickets else {
+            self.status.syncing = false;
+            self.publish_status();
+            return;
+        };
+
+        // One request for every contact, rather than one per ticket.
+        let contact_ids: Vec<String> = {
+            let mut ids: Vec<String> =
+                tickets.iter().filter_map(|t| t.contact_ids.first().cloned()).collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        let mut names = std::collections::HashMap::new();
+        for chunk in contact_ids.chunks(100) {
+            if let Ok(contacts) = client.contacts_batch(chunk).await {
+                for contact in contacts {
+                    names.insert(contact.id.clone(), contact);
+                }
+            }
+        }
+
+        let rows: Vec<MessageSummary> = tickets
+            .iter()
+            .map(|t| {
+                let contact = t.contact_ids.first().and_then(|id| names.get(id));
+                MessageSummary {
+                    id: t.id.clone(),
+                    folder_id: t.stage_id.clone(),
+                    subject: t.subject.clone(),
+                    from: match contact {
+                        Some(c) if !c.name.trim().is_empty() => {
+                            crate::model::Address::new(c.name.clone(), c.email.clone())
+                        }
+                        Some(c) => crate::model::Address::bare(c.email.clone()),
+                        None => crate::model::Address::new("(no contact)", ""),
+                    },
+                    received: t.updated.clone(),
+                    preview: crate::util::html_to_text(&t.content).chars().take(140).collect(),
+                    is_read: true,
+                    has_attachments: false,
+                    pending: Pending::None,
+                }
+            })
+            .collect();
+        let _ = self.db.upsert_messages(&rows);
+        let _ = self.db.recompute_counts();
+        self.emit(Event::FoldersChanged);
+        for folder in rows.iter().map(|r| r.folder_id.clone()).collect::<std::collections::HashSet<_>>() {
+            self.emit(Event::MessagesChanged(folder));
+        }
+        let _ = self.db.set_meta("last_sync", &now_unix().to_string());
+        self.status.syncing = false;
+        self.publish_status();
+    }
+
+    /// Assemble a ticket's correspondence: its description when it has one,
+    /// then each associated thread in turn. Threads stay labelled rather
+    /// than being silently merged, because a ticket often has several.
+    async fn ensure_ticket_body(&mut self, ticket_id: &str) {
+        let Backend::Tickets { client, .. } = &self.backend else { return };
+        let client = client.clone();
+        let cached = matches!(self.db.message(ticket_id), Ok(Some(m)) if m.body.is_some());
+        if cached {
+            return;
+        }
+        let threads = client.ticket_threads(ticket_id).await;
+        self.note_hubspot(&threads);
+        let Ok(threads) = threads else { return };
+
+        let mut collected: Vec<(String, Vec<crate::hubspot::ThreadMessage>)> = Vec::new();
+        for thread in &threads {
+            let messages = client.thread_messages(thread).await;
+            self.note_hubspot(&messages);
+            if let Ok(messages) = messages {
+                collected.push((thread.clone(), messages));
+            }
+        }
+        // A ticket raised through a web form has no thread; its own text is
+        // the only thing to show until someone answers.
+        let description = self
+            .db
+            .message(ticket_id)
+            .ok()
+            .flatten()
+            .map(|m| crate::util::escape_html(&m.summary.preview))
+            .unwrap_or_default();
+        let html = crate::hubspot::assemble_ticket_html(&description, &collected);
+
+        let body = Body { is_html: true, content: html };
+        if self.db.set_body(ticket_id, &body, &[], &[]).is_ok() {
+            let _ = self.db.set_thread_ids(ticket_id, &threads);
+            self.emit(Event::BodyReady(ticket_id.to_string()));
+        }
+    }
+
+    /// HubSpot failures get the same treatment as Graph ones.
+    fn note_hubspot<T>(&mut self, result: &std::result::Result<T, crate::hubspot::Error>) {
+        match result {
+            Ok(_) => {
+                self.status.online = true;
+                self.status.detail = None;
+            }
+            Err(e) if e.is_offline() => {
+                self.status.online = false;
+                self.status.detail = Some("Offline — showing cached tickets".into());
+            }
+            Err(e) => {
+                let message = format!("{}: {e}", self.label);
+                eprintln!("openlook: {message}");
+                self.status.detail = Some(e.to_string());
+                self.emit(Event::Failed(message));
+            }
+        }
+    }
+
     async fn sync_all(&mut self, folder: Option<String>) {
-        let Some(graph) = self.graph.clone() else {
+        if matches!(self.backend, Backend::Tickets { .. }) {
+            let _ = folder;
+            self.sync_tickets().await;
+            return;
+        }
+        let Some(graph) = self.backend.mail() else {
             // Demo mode: the cache is the whole world.
             let _ = self.db.recompute_counts();
             self.emit(Event::FoldersChanged);
@@ -354,7 +540,12 @@ impl Engine {
     }
 
     async fn sync_folder(&mut self, folder_id: &str) {
-        let Some(graph) = self.graph.clone() else { return };
+        if matches!(self.backend, Backend::Tickets { .. }) {
+            let _ = folder_id;
+            self.sync_tickets().await;
+            return;
+        }
+        let Some(graph) = self.backend.mail() else { return };
         let cursor = self.db.delta_link(folder_id);
 
         // First contact with a folder: pull the newest messages in order so
@@ -419,7 +610,7 @@ impl Engine {
             self.emit(Event::EventReady(id.to_string()));
             return;
         }
-        let Some(graph) = self.graph.clone() else { return };
+        let Some(graph) = self.backend.mail() else { return };
         let detail = graph.event_detail(id).await;
         self.note_result(&detail);
         if let Ok((body, attendees)) = detail {
@@ -432,7 +623,7 @@ impl Engine {
     /// Refresh the cached calendar for a window. The server view is the
     /// truth for that range, so cancellations disappear too.
     async fn sync_calendar(&mut self, start: &str, end: &str) {
-        let Some(graph) = self.graph.clone() else { return };
+        let Some(graph) = self.backend.mail() else { return };
         let events = graph.calendar_view(start, end).await;
         self.note_result(&events);
         if let Ok(events) = events {
@@ -444,7 +635,7 @@ impl Engine {
 
     /// Download the newest bodies so they are readable without a network.
     async fn prefetch_bodies(&mut self, folder_id: &str) {
-        let Some(graph) = self.graph.clone() else { return };
+        let Some(graph) = self.backend.mail() else { return };
         let Ok(ids) = self.db.missing_bodies(folder_id, PREFETCH) else { return };
         if ids.is_empty() {
             return;
@@ -487,11 +678,15 @@ impl Engine {
     }
 
     async fn ensure_body(&mut self, id: &str) {
+        if matches!(self.backend, Backend::Tickets { .. }) {
+            self.ensure_ticket_body(id).await;
+            return;
+        }
         let already = matches!(self.db.message(id), Ok(Some(m)) if m.body.is_some());
         if already {
             return;
         }
-        let Some(graph) = self.graph.clone() else {
+        let Some(graph) = self.backend.mail() else {
             self.emit(Event::Failed("This message is not available offline.".into()));
             return;
         };
@@ -526,7 +721,7 @@ impl Engine {
     /// Replay queued changes. Anything that fails for a retryable reason
     /// stays in the queue for the next attempt.
     async fn flush(&mut self) {
-        let Some(graph) = self.graph.clone() else { return };
+        let Some(graph) = self.backend.mail() else { return };
         let Ok(queued) = self.db.queued() else { return };
         if queued.is_empty() {
             return;

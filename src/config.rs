@@ -15,6 +15,12 @@ pub const DEFAULT_TENANT: &str = "organizations";
 pub const APP_ID: &str = "com.opslogix.Openlook";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineRef {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub client_id: String,
@@ -24,11 +30,21 @@ pub struct Settings {
     /// account prompt does not reappear at every launch.
     #[serde(default)]
     pub demo_ack: bool,
+    /// HubSpot ticket pipelines to show. Each becomes its own section in
+    /// the folder pane, with its stages as folders. Stage labels repeat
+    /// across pipelines, so the label is kept alongside the id.
+    #[serde(default)]
+    pub hubspot_pipelines: Vec<PipelineRef>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { client_id: DEFAULT_CLIENT_ID.into(), tenant: DEFAULT_TENANT.into(), demo_ack: false }
+        Self {
+            client_id: DEFAULT_CLIENT_ID.into(),
+            tenant: DEFAULT_TENANT.into(),
+            demo_ack: false,
+            hubspot_pipelines: Vec::new(),
+        }
     }
 }
 
@@ -69,6 +85,20 @@ pub fn data_dir() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     config_dir().join("settings.json")
+}
+
+/// HubSpot private-app token, kept out of settings.json so it is not
+/// caught up in anything the settings file gets used for.
+pub fn hubspot_token_path() -> PathBuf {
+    config_dir().join("hubspot-token")
+}
+
+/// The token, if one has been placed there.
+pub fn hubspot_token() -> Option<String> {
+    fs::read_to_string(hubspot_token_path())
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 pub fn tokens_path() -> PathBuf {
