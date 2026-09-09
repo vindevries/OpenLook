@@ -10,7 +10,9 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::graph::folder_rank;
-use crate::model::{Address, Body, Folder, MessageDetail, MessageSummary, Op, Pending};
+use crate::model::{
+    Address, Body, CalendarEvent, Folder, MessageDetail, MessageSummary, Op, Pending,
+};
 use crate::util::now_unix;
 
 const SCHEMA: &str = r#"
@@ -48,6 +50,18 @@ CREATE TABLE IF NOT EXISTS outbox (
     last_error TEXT,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id        TEXT PRIMARY KEY,
+    subject   TEXT NOT NULL DEFAULT '',
+    organizer TEXT NOT NULL DEFAULT '',
+    location  TEXT NOT NULL DEFAULT '',
+    start_utc TEXT NOT NULL,
+    end_utc   TEXT NOT NULL,
+    all_day   INTEGER NOT NULL DEFAULT 0,
+    cancelled INTEGER NOT NULL DEFAULT 0,
+    preview   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_utc);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
@@ -518,6 +532,72 @@ impl Db {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(ids)
+    }
+
+    // -- calendar --------------------------------------------------------
+
+    /// Replace everything cached for a date range. The server view is the
+    /// truth for that window, so this also removes events cancelled or
+    /// moved away since the last sync.
+    pub fn replace_events(&self, start: &str, end: &str, events: &[CalendarEvent]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1",
+            params![start, end],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO events
+                     (id, subject, organizer, location, start_utc, end_utc,
+                      all_day, cancelled, preview)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for e in events {
+                stmt.execute(params![
+                    e.id,
+                    e.subject,
+                    e.organizer,
+                    e.location,
+                    e.start,
+                    e.end,
+                    e.all_day as i64,
+                    e.cancelled as i64,
+                    e.preview,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Events overlapping a range, earliest first.
+    pub fn events_between(&self, start: &str, end: &str) -> Result<Vec<CalendarEvent>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, subject, organizer, location, start_utc, end_utc,
+                    all_day, cancelled, preview
+               FROM events
+              WHERE start_utc < ?2 AND end_utc > ?1
+              ORDER BY all_day DESC, start_utc",
+        )?;
+        let rows = stmt
+            .query_map(params![start, end], |r| {
+                Ok(CalendarEvent {
+                    id: r.get(0)?,
+                    subject: r.get(1)?,
+                    organizer: r.get(2)?,
+                    location: r.get(3)?,
+                    start: r.get(4)?,
+                    end: r.get(5)?,
+                    all_day: r.get::<_, i64>(6)? != 0,
+                    cancelled: r.get::<_, i64>(7)? != 0,
+                    preview: r.get(8)?,
+                    mailbox: String::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // -- meta ------------------------------------------------------------

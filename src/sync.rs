@@ -74,6 +74,8 @@ pub enum Cmd {
     SyncFolder(String),
     /// Make sure a message body is cached, downloading it if needed.
     OpenMessage(String),
+    /// Refresh the calendar for a window, given as RFC3339 UTC bounds.
+    SyncCalendar { start: String, end: String },
     /// Try to push queued changes now.
     Flush,
     SetOnline(bool),
@@ -84,6 +86,7 @@ pub enum Event {
     FoldersChanged,
     MessagesChanged(String),
     BodyReady(String),
+    CalendarChanged,
     StatusChanged(Status),
     Failed(String),
     Notice(String),
@@ -265,6 +268,7 @@ impl Engine {
                 }
             }
             Cmd::OpenMessage(id) => self.ensure_body(&id).await,
+            Cmd::SyncCalendar { start, end } => self.sync_calendar(&start, &end).await,
             Cmd::Flush => {
                 self.flush().await;
                 self.publish_status();
@@ -399,6 +403,19 @@ impl Engine {
             }
         }
         self.prefetch_bodies(folder_id).await;
+    }
+
+    /// Refresh the cached calendar for a window. The server view is the
+    /// truth for that range, so cancellations disappear too.
+    async fn sync_calendar(&mut self, start: &str, end: &str) {
+        let Some(graph) = self.graph.clone() else { return };
+        let events = graph.calendar_view(start, end).await;
+        self.note_result(&events);
+        if let Ok(events) = events {
+            if self.db.replace_events(start, end, &events).is_ok() {
+                self.emit(Event::CalendarChanged);
+            }
+        }
     }
 
     /// Download the newest bodies so they are readable without a network.

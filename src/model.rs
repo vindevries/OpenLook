@@ -162,3 +162,20 @@ impl Default for Status {
         Self { online: true, syncing: false, queued: 0, last_sync: None, detail: None }
     }
 }
+
+/// A calendar entry, as shown in the month view. Times are RFC3339 in UTC
+/// so they sort correctly; they are converted to local time for display.
+#[derive(Debug, Clone)]
+pub struct CalendarEvent {
+    pub id: String,
+    pub subject: String,
+    pub organizer: String,
+    pub location: String,
+    pub start: String,
+    pub end: String,
+    pub all_day: bool,
+    pub cancelled: bool,
+    pub preview: String,
+    /// Which mailbox it came from, filled in when events are merged.
+    pub mailbox: String,
+}

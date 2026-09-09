@@ -115,6 +115,8 @@ pub struct State {
     folder_title: gtk::Label,
     count_label: gtk::Label,
     connection_label: gtk::Label,
+    pub calendar: crate::ui::calendar::CalendarUi,
+    view_stack: gtk::Stack,
     #[cfg(feature = "html-view")]
     webview: webkit::WebView,
     #[cfg(not(feature = "html-view"))]
@@ -487,10 +489,46 @@ pub fn build(app: &adw::Application) {
     status_bar.append(&status_spacer);
     status_bar.append(&connection_label);
 
+    // Mail and Calendar as separate pages, switched from a rail on the left
+    // the way Outlook's module buttons work.
+    let calendar = crate::ui::calendar::CalendarUi::new();
+    let view_stack = gtk::Stack::new();
+    view_stack.set_hexpand(true);
+    view_stack.add_named(&body, Some("mail"));
+    view_stack.add_named(&calendar.root, Some("calendar"));
+
+    let rail = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(8)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    rail.add_css_class("view-rail");
+    let mail_button = gtk::ToggleButton::builder()
+        .icon_name("mail-unread-symbolic")
+        .tooltip_text("Mail")
+        .active(true)
+        .build();
+    mail_button.add_css_class("flat");
+    let calendar_button = gtk::ToggleButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Calendar")
+        .build();
+    calendar_button.add_css_class("flat");
+    calendar_button.set_group(Some(&mail_button));
+    rail.append(&mail_button);
+    rail.append(&calendar_button);
+
+    let shell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    shell.append(&rail);
+    shell.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    shell.append(&view_stack);
+
     let view = ToolbarView::new();
     view.add_top_bar(&header);
     view.add_top_bar(&command_bar);
-    view.set_content(Some(&body));
+    view.set_content(Some(&shell));
     view.add_bottom_bar(&status_bar);
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(view.widget()));
@@ -515,6 +553,8 @@ pub fn build(app: &adw::Application) {
         folder_title,
         count_label,
         connection_label,
+        calendar,
+        view_stack,
         #[cfg(feature = "html-view")]
         webview,
         #[cfg(not(feature = "html-view"))]
@@ -532,6 +572,33 @@ pub fn build(app: &adw::Application) {
         newest_first: Cell::new(true),
         rebuilding: Cell::new(false),
     });
+
+    {
+        // The command bar is mail-only, so it steps aside for the calendar.
+        let s = state.clone();
+        let command_bar = command_bar.clone();
+        calendar_button.connect_toggled(move |button| {
+            if button.is_active() {
+                s.view_stack.set_visible_child_name("calendar");
+                command_bar.set_visible(false);
+                crate::ui::calendar::refresh(&s);
+                crate::ui::calendar::request_sync(&s);
+            } else {
+                s.view_stack.set_visible_child_name("mail");
+                command_bar.set_visible(true);
+            }
+        });
+    }
+    for (button, delta) in
+        [(state.calendar.prev.clone(), -1), (state.calendar.next.clone(), 1)]
+    {
+        let s = state.clone();
+        button.connect_clicked(move |_| crate::ui::calendar::step_month(&s, delta));
+    }
+    {
+        let s = state.clone();
+        state.calendar.today.connect_clicked(move |_| crate::ui::calendar::go_today(&s));
+    }
 
     connect_signals(&state, app);
     for index in 0..state.sessions.borrow().len() {
@@ -747,6 +814,7 @@ pub fn listen(state: &Rc<State>, index: usize) {
                         reload_folders(&state, false);
                     }
                 }
+                Event::CalendarChanged => crate::ui::calendar::refresh(&state),
                 Event::Failed(message) | Event::Notice(message) => toast(&state, &message),
             }
         }

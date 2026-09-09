@@ -17,6 +17,9 @@ Graph API and keeps a local copy so mail is readable **offline**.
   All / Unread filter and a date sort toggle
 - Reading pane with contact initials, Reply, Reply all and Forward
 - Drag a message onto a folder to move it (within the same mailbox)
+- **Calendar**: a month view switched from the rail on the left, merging
+  every mailbox's events (colour-coded), with a day panel showing times,
+  location and organiser. Cached like mail, so it reads offline
 - **Works offline**: mail is cached in SQLite and message bodies are
   prefetched, so the app opens instantly and stays readable with no network
 - **Changes made offline are queued** — read/unread, delete and messages you
@@ -81,7 +84,7 @@ use the demo mailbox.
 public "Microsoft Graph Command Line Tools" application
 (`14d82eec-204b-4c2f-b7e8-296a70dab67e`), the same public client Microsoft's
 own Graph PowerShell uses, requesting delegated `User.Read`, `Mail.ReadWrite`
-and `Mail.Send` scopes. The first sign-in shows a consent prompt for those
+`Mail.Send` and `Calendars.Read` scopes. The first sign-in shows a consent prompt for those
 permissions.
 
 If your organization blocks that app, register your own (2 minutes) and paste
@@ -91,7 +94,8 @@ its client ID under **Advanced** in the sign-in dialog, or in Settings:
    **New registration**. No redirect URI needed.
 2. **Authentication** → **Allow public client flows** → **Yes** → Save.
 3. **API permissions** → Microsoft Graph → Delegated: `User.Read`,
-   `Mail.ReadWrite`, `Mail.Send` (grant admin consent if required).
+   `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read` (grant admin consent if
+   required).
 
 ## How offline works
 
@@ -133,7 +137,7 @@ tools/dev-shim.sh build without the GTK -dev packages
 
 ## Roadmap
 
-- Calendar pane
+- Creating and editing appointments (the calendar is read-only today)
 - Attachments (view/save/send)
 - Full-text search across folders (the cache makes this cheap)
 - New-mail desktop notifications

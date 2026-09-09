@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 
 use crate::db::Db;
 use crate::graph::folder_rank;
-use crate::model::{Address, Body, Folder, MessageSummary, Pending};
+use crate::model::{Address, Body, CalendarEvent, Folder, MessageSummary, Pending};
 use crate::util::html_to_text;
 
 fn ago(hours: i64) -> String {
@@ -224,5 +224,62 @@ pub fn seed(db: &Db) -> Result<()> {
         db.insert_local_message(&summary, &to, &[], &body)?;
     }
     db.recompute_counts()?;
+    seed_events(db)?;
+    Ok(())
+}
+
+/// A week of plausible appointments around today, so the calendar has
+/// something to show before an account is connected.
+fn seed_events(db: &Db) -> Result<()> {
+    let today = Utc::now().date_naive();
+    let at = |day_offset: i64, hour: u32, minutes: i64| -> (String, String) {
+        let start = (today + Duration::days(day_offset))
+            .and_hms_opt(hour, 0, 0)
+            .map(|dt| dt.and_utc())
+            .unwrap_or_else(Utc::now);
+        (start.to_rfc3339(), (start + Duration::minutes(minutes)).to_rfc3339())
+    };
+
+    let plan: &[(i64, u32, i64, &str, &str, &str, bool)] = &[
+        (0, 9, 30, "Daily stand-up", "Teams", "Anna Visser", false),
+        (0, 13, 60, "Q3 planning review", "Board room", "Anna Visser", false),
+        (1, 10, 45, "SCOM connector — renewal call", "Teams", "Mark de Jong", false),
+        (2, 0, 0, "Company day", "Amsterdam", "HR Team", true),
+        (3, 11, 30, "Pilot environment kick-off", "Teams", "Sofia Lindqvist", false),
+        (4, 15, 60, "Coffee with Thomas", "Zuidas", "Thomas Berg", false),
+        (7, 9, 90, "Sprint review", "Teams", "Jira", false),
+    ];
+
+    let events: Vec<CalendarEvent> = plan
+        .iter()
+        .enumerate()
+        .map(|(index, (day, hour, minutes, subject, location, organizer, all_day))| {
+            let (start, end) = if *all_day {
+                let day_start = (today + Duration::days(*day))
+                    .and_hms_opt(0, 0, 0)
+                    .map(|dt| dt.and_utc())
+                    .unwrap_or_else(Utc::now);
+                (day_start.to_rfc3339(), (day_start + Duration::days(1)).to_rfc3339())
+            } else {
+                at(*day, *hour, *minutes)
+            };
+            CalendarEvent {
+                id: format!("demo-event-{index}"),
+                subject: (*subject).to_string(),
+                organizer: (*organizer).to_string(),
+                location: (*location).to_string(),
+                start,
+                end,
+                all_day: *all_day,
+                cancelled: false,
+                preview: String::new(),
+                mailbox: "Demo mailbox".to_string(),
+            }
+        })
+        .collect();
+
+    let from = (today - Duration::days(40)).and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc3339();
+    let to = (today + Duration::days(40)).and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc3339();
+    db.replace_events(&from, &to, &events)?;
     Ok(())
 }

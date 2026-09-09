@@ -16,7 +16,8 @@ use crate::config::{tokens_path, Settings};
 use crate::model::AccountInfo;
 use crate::util::now_unix;
 
-const SCOPES: &str = "openid profile email offline_access User.Read Mail.ReadWrite Mail.Send";
+const SCOPES: &str = "openid profile email offline_access User.Read \
+                      Mail.ReadWrite Mail.Send Calendars.Read";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Tokens {

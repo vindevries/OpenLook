@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::auth::Auth;
-use crate::model::{Address, Body, Folder, MessageSummary, Outgoing, Pending, SendMode};
+use crate::model::{
+    Address, Body, CalendarEvent, Folder, MessageSummary, Outgoing, Pending, SendMode,
+};
 use crate::util::html_to_text;
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -132,6 +134,11 @@ impl Graph {
     async fn send(&self, req: reqwest::RequestBuilder) -> GraphResult<Option<Value>> {
         let token = self.token().await?;
         let resp = req.bearer_auth(token).send().await?;
+        self.read(resp).await
+    }
+
+    /// Turn a response into JSON, classifying failures for the sync engine.
+    async fn read(&self, resp: reqwest::Response) -> GraphResult<Option<Value>> {
         let status = resp.status();
         if status.is_success() {
             if status == reqwest::StatusCode::NO_CONTENT {
@@ -266,6 +273,65 @@ impl Graph {
         Ok(DeltaPage { changes, cursor: Some(url), complete: false })
     }
 
+    /// Events overlapping a window. calendarView is the right endpoint here
+    /// rather than /events: it expands recurring series into occurrences,
+    /// which is what a month grid needs to show.
+    pub async fn calendar_view(&self, start: &str, end: &str) -> GraphResult<Vec<CalendarEvent>> {
+        let mut url = format!(
+            "{GRAPH}/me/calendarView?startDateTime={start}&endDateTime={end}\
+             &$select=id,subject,organizer,location,start,end,isAllDay,isCancelled,bodyPreview\
+             &$orderby=start/dateTime&$top=200"
+        );
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            let token = self.token().await?;
+            // Ask for UTC so the times need no timezone guessing here.
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(token)
+                .header("Prefer", "outlook.timezone=\"UTC\"")
+                .send()
+                .await?;
+            let data = match self.read(resp).await? {
+                Some(data) => data,
+                None => break,
+            };
+            for item in data["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                let id = item["id"].as_str().unwrap_or_default().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                events.push(CalendarEvent {
+                    id,
+                    subject: {
+                        let s = item["subject"].as_str().unwrap_or_default();
+                        if s.is_empty() { "(no subject)".into() } else { s.to_string() }
+                    },
+                    organizer: item["organizer"]["emailAddress"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    location: item["location"]["displayName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    start: graph_time(&item["start"]),
+                    end: graph_time(&item["end"]),
+                    all_day: item["isAllDay"].as_bool().unwrap_or(false),
+                    cancelled: item["isCancelled"].as_bool().unwrap_or(false),
+                    preview: html_to_text(item["bodyPreview"].as_str().unwrap_or_default()),
+                    mailbox: self.username.clone(),
+                });
+            }
+            match data["@odata.nextLink"].as_str() {
+                Some(next) => url = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(events)
+    }
+
     /// Full message: recipients plus the body.
     pub async fn detail(&self, id: &str) -> GraphResult<(Vec<Address>, Vec<Address>, Body)> {
         let url = format!(
@@ -353,6 +419,18 @@ impl Graph {
         });
         self.send(self.http.post(url).json(&payload)).await?;
         Ok(())
+    }
+}
+
+/// Graph hands back `2026-09-09T10:00:00.0000000` with a separate timeZone
+/// field; we ask for UTC, so trim the fraction and mark it as such.
+fn graph_time(v: &Value) -> String {
+    let raw = v["dateTime"].as_str().unwrap_or_default();
+    let trimmed = raw.split('.').next().unwrap_or(raw);
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}Z")
     }
 }
 

@@ -103,6 +103,43 @@ const CSS: &str = r#"
   border-radius: 6px;
 }
 
+/* Calendar */
+.view-rail button { min-width: 34px; padding: 6px; }
+.cal-weekday {
+  font-size: 0.8em;
+  font-weight: 700;
+  opacity: 0.6;
+  padding: 4px 0;
+}
+.cal-day {
+  border: 1px solid alpha(currentColor, 0.10);
+  padding: 3px 4px;
+}
+.cal-outside { opacity: 0.45; }
+.cal-today { background: alpha(@accent_bg_color, 0.10); }
+.cal-selected { border: 2px solid @accent_bg_color; }
+.cal-daynum { font-size: 0.85em; font-weight: 700; }
+.cal-more { font-size: 0.75em; opacity: 0.6; }
+.event-chip {
+  font-size: 0.78em;
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: #ffffff;
+}
+.event-cancelled { text-decoration: line-through; opacity: 0.6; }
+.mailbox-0 { background: #0F6CBD; }
+.mailbox-1 { background: #107C41; }
+.mailbox-2 { background: #8764B8; }
+.mailbox-3 { background: #C55100; }
+.mailbox-4 { background: #00707F; }
+.mailbox-5 { background: #C4314B; }
+.mailbox-text-0 { color: #0F6CBD; font-weight: 700; }
+.mailbox-text-1 { color: #107C41; font-weight: 700; }
+.mailbox-text-2 { color: #8764B8; font-weight: 700; }
+.mailbox-text-3 { color: #C55100; font-weight: 700; }
+.mailbox-text-4 { color: #00707F; font-weight: 700; }
+.mailbox-text-5 { color: #C4314B; font-weight: 700; }
+
 /* Status bar */
 .status-bar {
   border-top: 1px solid alpha(currentColor, 0.12);
