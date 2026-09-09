@@ -465,10 +465,15 @@ impl Engine {
 
         let mut collected: Vec<(String, Vec<crate::hubspot::ThreadMessage>)> = Vec::new();
         for thread in &threads {
-            let messages = client.thread_messages(thread).await;
-            self.note_hubspot(&messages);
-            if let Ok(messages) = messages {
-                collected.push((thread.clone(), messages));
+            match client.thread_messages(thread).await {
+                Ok(messages) => {
+                    self.status.online = true;
+                    collected.push((thread.clone(), messages));
+                }
+                // A thread that has gone is simply not shown; the rest of
+                // the ticket still reads fine.
+                Err(crate::hubspot::Error::NotFound) => continue,
+                Err(e) => self.note_hubspot(&Err::<(), _>(e)),
             }
         }
         // A ticket raised through a web form has no thread; its own text is

@@ -15,6 +15,11 @@ use std::fmt;
 use serde_json::Value;
 
 const API: &str = "https://api.hubapi.com";
+/// Ticket→conversation association that actually yields a conversation
+/// thread. A ticket is also associated with type 278, whose ids the
+/// conversations API does not serve — following those produced a 404 per
+/// ticket and inflated the apparent number of threads.
+const THREAD_ASSOCIATION: i64 = 32;
 
 #[derive(Debug)]
 pub enum Error {
@@ -33,7 +38,7 @@ impl fmt::Display for Error {
         match self {
             Error::Offline(_) => write!(f, "You are offline — showing cached tickets."),
             Error::Auth(m) => write!(f, "HubSpot refused the token: {m}"),
-            Error::NotFound => write!(f, "That ticket no longer exists."),
+            Error::NotFound => write!(f, "HubSpot no longer has that item."),
             Error::Transient(m) | Error::Permanent(m) => write!(f, "{m}"),
         }
     }
@@ -378,7 +383,7 @@ impl HubSpot {
     }
 
     /// Conversation threads associated with a ticket. A web-form ticket has
-    /// none until someone replies. (unverified: association type name)
+    /// none until someone replies.
     pub async fn ticket_threads(&self, ticket_id: &str) -> Result<Vec<String>> {
         let path = format!("/crm/v4/objects/tickets/{ticket_id}/associations/conversations");
         let data = self.get(&path).await?;
@@ -387,9 +392,20 @@ impl HubSpot {
             .map(|v| v.as_slice())
             .unwrap_or_default()
             .iter()
-            .filter_map(|r| r["toObjectId"].as_str().map(str::to_string).or_else(|| {
-                r["toObjectId"].as_i64().map(|n| n.to_string())
-            }))
+            .filter(|entry| {
+                entry["associationTypes"]
+                    .as_array()
+                    .map(|types| {
+                        types.iter().any(|t| t["typeId"].as_i64() == Some(THREAD_ASSOCIATION))
+                    })
+                    .unwrap_or(false)
+            })
+            .filter_map(|entry| {
+                entry["toObjectId"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| entry["toObjectId"].as_i64().map(|n| n.to_string()))
+            })
             .collect())
     }
 
