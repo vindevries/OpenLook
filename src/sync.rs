@@ -21,6 +21,10 @@ use crate::util::now_unix;
 
 /// How many messages the first sync of a folder pulls down.
 const WINDOW: u32 = 100;
+/// Delta pages fetched per folder per sync. Bounds one tick's work while
+/// still letting a large folder finish its first enumeration over a few
+/// passes, after which each sync is a single cheap request.
+const DELTA_PAGES_PER_SYNC: usize = 10;
 /// How many bodies to prefetch per folder so mail is readable offline.
 const PREFETCH: usize = 40;
 /// Concurrent body downloads.
@@ -342,55 +346,56 @@ impl Engine {
 
     async fn sync_folder(&mut self, folder_id: &str) {
         let Some(graph) = self.graph.clone() else { return };
+        let cursor = self.db.delta_link(folder_id);
 
-        // Incremental path: ask only for what changed since last time.
-        if let Some(link) = self.db.delta_link(folder_id) {
-            let page = graph.delta(folder_id, Some(&link), 20).await;
-            self.note_result(&page);
-            match page {
-                Ok(page) => {
-                    let mut upserts = Vec::new();
-                    let mut removed = Vec::new();
-                    for change in page.changes {
-                        match change {
-                            Change::Upsert(m) => upserts.push(m),
-                            Change::Removed(id) => removed.push(id),
-                        }
-                    }
-                    let changed = !upserts.is_empty() || !removed.is_empty();
-                    let _ = self.db.upsert_messages(&upserts);
-                    for id in &removed {
-                        let _ = self.db.remove_message(id);
-                    }
-                    if let Some(next) = page.delta_link {
-                        let _ = self.db.set_delta_link(folder_id, Some(&next));
-                    }
-                    if changed {
-                        self.emit(Event::MessagesChanged(folder_id.to_string()));
-                    }
-                    self.prefetch_bodies(folder_id).await;
-                    return;
-                }
-                Err(e) if e.is_offline() => return,
-                Err(_) => {
-                    // Token rejected or expired — fall back to a full window.
-                    let _ = self.db.set_delta_link(folder_id, None);
-                }
-            }
+        // First contact with a folder: pull the newest messages in order so
+        // the list fills immediately. The delta enumeration that follows is
+        // unordered, so on its own it would populate the view raggedly.
+        if cursor.is_none() {
+            let window = graph.messages_window(folder_id, WINDOW).await;
+            self.note_result(&window);
+            let Ok(messages) = window else { return };
+            let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+            let oldest =
+                messages.iter().map(|m| m.received.as_str()).min().unwrap_or("").to_string();
+            let _ = self.db.upsert_messages(&messages);
+            let _ = self.db.reconcile_window(folder_id, &ids, &oldest);
+            self.emit(Event::MessagesChanged(folder_id.to_string()));
         }
 
-        let window = graph.messages_window(folder_id, WINDOW).await;
-        self.note_result(&window);
-        let Ok(messages) = window else { return };
-        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-        let oldest = messages.iter().map(|m| m.received.as_str()).min().unwrap_or("").to_string();
-        let _ = self.db.upsert_messages(&messages);
-        let _ = self.db.reconcile_window(folder_id, &ids, &oldest);
-        self.emit(Event::MessagesChanged(folder_id.to_string()));
-
-        // Start the incremental chain from "now" so later syncs are cheap.
-        if let Ok(Some(token)) = graph.delta_token_latest(folder_id).await {
-            let _ = self.db.set_delta_link(folder_id, Some(&token));
+        let page = graph.delta(folder_id, cursor.as_deref(), DELTA_PAGES_PER_SYNC).await;
+        self.note_result(&page);
+        match page {
+            Ok(page) => {
+                let mut upserts = Vec::new();
+                let mut removed = Vec::new();
+                for change in page.changes {
+                    match change {
+                        Change::Upsert(m) => upserts.push(m),
+                        Change::Removed(id) => removed.push(id),
+                    }
+                }
+                let changed = !upserts.is_empty() || !removed.is_empty();
+                let _ = self.db.upsert_messages(&upserts);
+                for id in &removed {
+                    let _ = self.db.remove_message(id);
+                }
+                // Keep whatever came back — a deltaLink once caught up, or a
+                // nextLink partway through. Storing the nextLink is the point:
+                // without it a folder too big to enumerate in one pass would
+                // start from scratch every time and never earn a token.
+                if let Some(cursor) = page.cursor {
+                    let _ = self.db.set_delta_link(folder_id, Some(&cursor));
+                }
+                if changed {
+                    self.emit(Event::MessagesChanged(folder_id.to_string()));
+                }
+            }
+            Err(e) if e.is_offline() => return,
+            Err(_) => {
+                // Cursor rejected or expired: start the chain again next time.
+                let _ = self.db.set_delta_link(folder_id, None);
+            }
         }
         self.prefetch_bodies(folder_id).await;
     }

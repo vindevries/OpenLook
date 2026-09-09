@@ -21,8 +21,10 @@ Graph API and keeps a local copy so mail is readable **offline**.
 - **Changes made offline are queued** — read/unread, delete and messages you
   write are applied locally at once and pushed to the server when you
   reconnect (they survive quitting the app)
-- Incremental sync using Graph delta queries, with a full-window resync as a
-  fallback; local edits are never clobbered by a stale sync
+- Incremental sync using Graph delta queries — the first enumeration is
+  bounded to a recent window so a token arrives in one request, after which
+  each poll is a single cheap call; local edits are never clobbered by a
+  stale sync
 - Read HTML mail (WebKitGTK, JavaScript disabled; links open in your browser)
 - Compose, send, reply; mark read/unread; delete; per-folder search
 - **Demo mailbox** out of the box, so the whole UI works before you sign in
@@ -31,7 +33,9 @@ Graph API and keeps a local copy so mail is readable **offline**.
 
 ## Requirements
 
-A GTK4 desktop (stock Ubuntu 24.04+ has everything at runtime) and Rust.
+A GTK4 desktop and Rust. Ubuntu 22.04 is the oldest supported release: it has
+everything at runtime (GTK 4.6, libadwaita 1.1, and WebKitGTK 6.0 from
+jammy-updates), as does anything newer.
 
 ```bash
 # Rust, if you don't have it
@@ -52,6 +56,9 @@ binary is completely normal — the shim only affects build time.
 cargo run                 # run from the repo
 cargo test                # offline-behaviour tests (no display needed)
 ./install.sh              # build release + install launcher and icon
+
+./tools/mkdeb.sh                  # .deb for this machine
+./tools/mkdeb.sh --target jammy   # .deb for Ubuntu 22.04, from any newer host
 ```
 
 `install.sh` sources the shim automatically when the `-dev` packages are
@@ -129,4 +136,3 @@ tools/dev-shim.sh build without the GTK -dev packages
 - Attachments (view/save/send)
 - Full-text search across folders (the cache makes this cheap)
 - New-mail desktop notifications
-- `.deb` packaging

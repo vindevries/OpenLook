@@ -14,6 +14,15 @@ use crate::model::{Address, Body, Folder, MessageSummary, Outgoing, Pending, Sen
 use crate::util::html_to_text;
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
+/// Messages per delta page. Graph's default is small; asking for more
+/// cuts the number of round trips during the first enumeration.
+const DELTA_PAGE_SIZE: u32 = 100;
+/// How far back the first delta enumeration reaches. Without a bound Graph
+/// walks the entire folder before it hands out a token — tens of thousands
+/// of messages on a real mailbox — and until then every sync starts over.
+/// Bounded, a token arrives in one request and syncs are incremental from
+/// then on.
+const DELTA_WINDOW_DAYS: i64 = 30;
 const SUMMARY_FIELDS: &str =
     "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,parentFolderId";
 
@@ -93,8 +102,13 @@ pub enum Change {
 
 pub struct DeltaPage {
     pub changes: Vec<Change>,
-    /// Token to use for the next incremental sync, when the run completed.
-    pub delta_link: Option<String>,
+    /// Where to resume next time. Once the folder has been enumerated this
+    /// is a deltaLink (only changes since last time); until then it is the
+    /// nextLink partway through that enumeration, so a large folder picks up
+    /// where it left off instead of starting over.
+    pub cursor: Option<String>,
+    /// Whether `cursor` is a deltaLink, i.e. the folder is caught up.
+    pub complete: bool,
 }
 
 /// A Graph client bound to one signed-in mailbox.
@@ -150,6 +164,13 @@ impl Graph {
         self.send(self.http.get(url)).await?.ok_or_else(|| GraphError::Transient("Empty response".into()))
     }
 
+    async fn get_paged(&self, url: &str, page_size: u32) -> GraphResult<Value> {
+        let url = if url.starts_with("http") { url.to_string() } else { format!("{GRAPH}{url}") };
+        self.send(self.http.get(url).header("Prefer", format!("odata.maxpagesize={page_size}")))
+            .await?
+            .ok_or_else(|| GraphError::Transient("Empty response".into()))
+    }
+
     pub async fn folders(&self) -> GraphResult<Vec<Folder>> {
         let data = self
             .get("/me/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount")
@@ -191,23 +212,31 @@ impl Graph {
             .collect())
     }
 
-    /// Incremental sync. Pass the stored delta link to get only what changed.
+    /// Fetch changes for a folder. Pass the stored cursor to resume: either
+    /// a deltaLink (just what changed) or a nextLink partway through the
+    /// initial enumeration. `max_pages` bounds the work done in one call.
     pub async fn delta(
         &self,
         folder_id: &str,
-        delta_link: Option<&str>,
+        cursor: Option<&str>,
         max_pages: usize,
     ) -> GraphResult<DeltaPage> {
-        let mut url = match delta_link {
+        let mut url = match cursor {
             Some(link) => link.to_string(),
-            None => format!(
-                "{GRAPH}/me/mailFolders/{}/messages/delta?$select={SUMMARY_FIELDS}",
-                urlencoding::encode(folder_id)
-            ),
+            None => {
+                let since = (chrono::Utc::now() - chrono::Duration::days(DELTA_WINDOW_DAYS))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string();
+                format!(
+                    "{GRAPH}/me/mailFolders/{}/messages/delta?$select={SUMMARY_FIELDS}\
+                     &$filter=receivedDateTime%20ge%20{since}",
+                    urlencoding::encode(folder_id)
+                )
+            }
         };
         let mut changes = Vec::new();
         for _ in 0..max_pages {
-            let data = self.get(&url).await?;
+            let data = self.get_paged(&url, DELTA_PAGE_SIZE).await?;
             for item in data["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
                 let id = item["id"].as_str().unwrap_or_default().to_string();
                 if id.is_empty() {
@@ -219,38 +248,22 @@ impl Graph {
                     changes.push(Change::Upsert(parse_summary(item, folder_id)));
                 }
             }
-            if let Some(next) = data["@odata.nextLink"].as_str() {
-                url = next.to_string();
-                continue;
-            }
-            return Ok(DeltaPage {
-                changes,
-                delta_link: data["@odata.deltaLink"].as_str().map(str::to_string),
-            });
-        }
-        // Ran out of pages: keep what we have and resync fully next time.
-        Ok(DeltaPage { changes, delta_link: None })
-    }
-
-    /// A delta token representing "now", so the first sync can seed the
-    /// cache with a recent window instead of downloading the whole mailbox.
-    pub async fn delta_token_latest(&self, folder_id: &str) -> GraphResult<Option<String>> {
-        let url = format!(
-            "/me/mailFolders/{}/messages/delta?$deltatoken=latest&$select={SUMMARY_FIELDS}",
-            urlencoding::encode(folder_id)
-        );
-        let mut data = self.get(&url).await?;
-        // Follow nextLinks (should be none for 'latest') until the token appears.
-        for _ in 0..5 {
-            if let Some(link) = data["@odata.deltaLink"].as_str() {
-                return Ok(Some(link.to_string()));
+            if let Some(delta) = data["@odata.deltaLink"].as_str() {
+                // Caught up: from here on, syncs are a single cheap request.
+                return Ok(DeltaPage {
+                    changes,
+                    cursor: Some(delta.to_string()),
+                    complete: true,
+                });
             }
             match data["@odata.nextLink"].as_str() {
-                Some(next) => data = self.get(next).await?,
-                None => break,
+                Some(next) => url = next.to_string(),
+                // Neither link: nothing more to read and no token to keep.
+                None => return Ok(DeltaPage { changes, cursor: None, complete: false }),
             }
         }
-        Ok(None)
+        // Out of budget for this run; resume from this page next time.
+        Ok(DeltaPage { changes, cursor: Some(url), complete: false })
     }
 
     /// Full message: recipients plus the body.
