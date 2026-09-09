@@ -16,6 +16,7 @@ Graph API and keeps a local copy so mail is readable **offline**.
 - Message list grouped by date (Today / Yesterday / weekday / Last Week), an
   All / Unread filter and a date sort toggle
 - Reading pane with contact initials, Reply, Reply all and Forward
+- Drag a message onto a folder to move it (within the same mailbox)
 - **Works offline**: mail is cached in SQLite and message bodies are
   prefetched, so the app opens instantly and stays readable with no network
 - **Changes made offline are queued** — read/unread, delete and messages you

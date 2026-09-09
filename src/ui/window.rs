@@ -863,7 +863,7 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                 {
                     select_index = Some(index as i32);
                 }
-                folder_row(folder)
+                folder_row(state, *session, folder)
             }
             PaneRow::Notice { text, error } => pane_notice_row(text, *error),
         };
@@ -927,8 +927,39 @@ fn pane_notice_row(text: &str, error: bool) -> gtk::ListBoxRow {
     row
 }
 
-fn folder_row(folder: &Folder) -> gtk::ListBoxRow {
+fn folder_row(state: &Rc<State>, session: usize, folder: &Folder) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
+
+    let target = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+    {
+        let state = state.clone();
+        let folder_id = folder.id.clone();
+        let folder_name = folder.display_name.clone();
+        target.connect_drop(move |_, value, _, _| {
+            let Ok(payload) = value.get::<String>() else { return false };
+            let Some((from_session, message_id)) = parse_drag_payload(&payload) else {
+                return false;
+            };
+            if from_session != session {
+                toast(&state, "Messages can only be moved within the same mailbox.");
+                return false;
+            }
+            drop_message_into(&state, session, message_id, &folder_id, &folder_name);
+            true
+        });
+    }
+    // Highlight the folder the message is hovering over.
+    {
+        let row_for_enter = row.clone();
+        target.connect_enter(move |_, _, _| {
+            row_for_enter.add_css_class("drop-hover");
+            gdk::DragAction::MOVE
+        });
+        let row_for_leave = row.clone();
+        target.connect_leave(move |_| row_for_leave.remove_css_class("drop-hover"));
+    }
+    row.add_controller(target);
+
     let row_box = gtk::Box::builder()
         .spacing(8)
         .margin_top(5)
@@ -999,7 +1030,7 @@ pub fn reload_messages(state: &Rc<State>) {
             state.message_list.append(&date_header_row(&bucket));
             entries.push(ListEntry::DateHeader);
         }
-        state.message_list.append(&message_row(&message));
+        state.message_list.append(&message_row(&message, session_index));
         if current.as_deref() == Some(message.id.as_str()) {
             select_index = Some(entries.len() as i32);
         }
@@ -1044,8 +1075,30 @@ fn date_header_row(title: &str) -> gtk::ListBoxRow {
     row
 }
 
-fn message_row(message: &MessageSummary) -> gtk::ListBoxRow {
+/// Payload carried by a drag: which mailbox the message belongs to, and
+/// its id. The mailbox travels with it because Graph cannot move a message
+/// between mailboxes, so such a drop has to be refused rather than fail
+/// halfway.
+fn drag_payload(session: usize, message_id: &str) -> String {
+    format!("{session}\n{message_id}")
+}
+
+fn parse_drag_payload(payload: &str) -> Option<(usize, &str)> {
+    let (session, id) = payload.split_once('\n')?;
+    Some((session.parse().ok()?, id))
+}
+
+fn message_row(message: &MessageSummary, session: usize) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
+
+    // Drag a message onto a folder to move it.
+    let payload = drag_payload(session, &message.id);
+    let source = gtk::DragSource::builder().actions(gdk::DragAction::MOVE).build();
+    source.connect_prepare(move |_, _, _| {
+        Some(gdk::ContentProvider::for_value(&payload.to_value()))
+    });
+    row.add_controller(source);
+
     let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     row_box.add_css_class("message-row");
     if !message.is_read {
@@ -1245,6 +1298,35 @@ fn respond(state: &Rc<State>, mode: SendMode) {
     if let Some(detail) = current_detail(state) {
         ComposeWindow::open(state, state.active_session(), Some((detail, mode)));
     }
+}
+
+/// Move a dragged message into a folder of the same mailbox.
+fn drop_message_into(
+    state: &Rc<State>,
+    session: usize,
+    message_id: &str,
+    folder_id: &str,
+    folder_name: &str,
+) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let already = db.message(message_id).ok().flatten().map(|m| m.summary.folder_id);
+    if already.as_deref() == Some(folder_id) {
+        return;
+    }
+    let op = Op::Move { message_id: message_id.to_string(), folder_id: folder_id.to_string() };
+    let applied = state.sessions.borrow().get(session).map(|s| s.apply(op)).unwrap_or(Ok(()));
+    match applied {
+        Ok(()) => {
+            if state.current_message.borrow().as_deref() == Some(message_id) {
+                show_message(state, None);
+            }
+            toast(state, &format!("Moved to {folder_name}"));
+        }
+        Err(e) => toast(state, &e.to_string()),
+    }
+    reload_messages(state);
+    reload_folders(state, false);
+    render_status(state);
 }
 
 fn apply_op(state: &Rc<State>, op: Op) -> anyhow::Result<()> {

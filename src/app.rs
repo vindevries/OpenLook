@@ -98,6 +98,11 @@ const CSS: &str = r#"
 .avatar-4 { background: #C55100; }
 .avatar-5 { background: #00707F; }
 
+.drop-hover {
+  background: alpha(@accent_bg_color, 0.25);
+  border-radius: 6px;
+}
+
 /* Status bar */
 .status-bar {
   border-top: 1px solid alpha(currentColor, 0.12);
