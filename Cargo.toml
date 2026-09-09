@@ -8,8 +8,10 @@ license = "AGPL-3.0-only"
 default-run = "openlook"
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.8", features = ["v4_10"] }
-adw = { package = "libadwaita", version = "0.6", features = ["v1_4"] }
+# Feature levels set the oldest supported system: GTK 4.6 and libadwaita 1.1
+# are what Ubuntu 22.04 ships. See src/ui/widgets.rs for the stand-ins.
+gtk = { package = "gtk4", version = "0.8", features = ["v4_6"] }
+adw = { package = "libadwaita", version = "0.6", features = ["v1_1"] }
 webkit = { package = "webkit6", version = "0.3", optional = true }
 glib = "0.19"
 gio = "0.19"
