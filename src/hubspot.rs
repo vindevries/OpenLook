@@ -230,28 +230,68 @@ impl HubSpot {
         Ok(tickets)
     }
 
-    /// Every ticket in a pipeline, with its contact associations.
+    /// The working set for a pipeline: every open ticket, plus the most
+    /// recently touched closed ones for context and search.
     ///
-    /// The list endpoint is used rather than search because only it returns
-    /// associations; the pipeline filter is applied here instead.
-    pub async fn tickets_in_pipeline(&self, pipeline_id: &str, max_pages: usize) -> Result<Vec<Ticket>> {
+    /// Fetching by recency alone is not enough — a ticket parked "on hold"
+    /// months ago would fall off the end — and the plain list endpoint is
+    /// worse still, returning oldest first, which on a real portal means
+    /// pages of tickets closed years ago.
+    pub async fn tickets_for_pipeline(
+        &self,
+        pipeline_id: &str,
+        closed_stages: &[String],
+        recent_closed: usize,
+    ) -> Result<Vec<Ticket>> {
+        let mut out = Vec::new();
+        // Everything not in a closed stage, however old.
+        let open_filter = serde_json::json!([{
+            "filters": [
+                { "propertyName": "hs_pipeline", "operator": "EQ", "value": pipeline_id },
+                { "propertyName": "hs_pipeline_stage", "operator": "NOT_IN", "values": closed_stages },
+            ]
+        }]);
+        out.extend(self.search_tickets(&open_filter, usize::MAX).await?);
+
+        if recent_closed > 0 && !closed_stages.is_empty() {
+            let closed_filter = serde_json::json!([{
+                "filters": [
+                    { "propertyName": "hs_pipeline", "operator": "EQ", "value": pipeline_id },
+                    { "propertyName": "hs_pipeline_stage", "operator": "IN", "values": closed_stages },
+                ]
+            }]);
+            out.extend(self.search_tickets(&closed_filter, recent_closed).await?);
+        }
+
+        // Search does not return associations; fetch them for what we kept.
+        let ids: Vec<String> = out.iter().map(|t| t.id.clone()).collect();
+        let contacts = self.ticket_contacts(&ids).await.unwrap_or_default();
+        for ticket in &mut out {
+            if let Some(found) = contacts.get(&ticket.id) {
+                ticket.contact_ids = found.clone();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Search, newest activity first, following pages up to `limit`.
+    async fn search_tickets(&self, filter_groups: &Value, limit: usize) -> Result<Vec<Ticket>> {
         let mut out = Vec::new();
         let mut after: Option<String> = None;
-        for _ in 0..max_pages {
-            let mut path = String::from(
-                "/crm/v3/objects/tickets?limit=100\
-                 &properties=subject,content,hs_pipeline,hs_pipeline_stage,createdate,hs_lastmodifieddate,source_type\
-                 &associations=contacts",
-            );
+        loop {
+            let mut payload = serde_json::json!({
+                "filterGroups": filter_groups,
+                "sorts": [{ "propertyName": "hs_lastmodifieddate", "direction": "DESCENDING" }],
+                "properties": ["subject", "content", "hs_pipeline", "hs_pipeline_stage",
+                               "createdate", "hs_lastmodifieddate", "source_type"],
+                "limit": 100,
+            });
             if let Some(cursor) = &after {
-                path.push_str(&format!("&after={cursor}"));
+                payload["after"] = Value::String(cursor.clone());
             }
-            let data = self.get(&path).await?;
+            let data = self.post("/crm/v3/objects/tickets/search", &payload).await?;
             for item in data["results"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
                 let props = &item["properties"];
-                if props["hs_pipeline"].as_str().unwrap_or_default() != pipeline_id {
-                    continue;
-                }
                 out.push(Ticket {
                     id: item["id"].as_str().unwrap_or_default().to_string(),
                     subject: props["subject"].as_str().unwrap_or("(no subject)").to_string(),
@@ -260,16 +300,51 @@ impl HubSpot {
                     created: props["createdate"].as_str().unwrap_or_default().to_string(),
                     updated: props["hs_lastmodifieddate"].as_str().unwrap_or_default().to_string(),
                     source: props["source_type"].as_str().unwrap_or_default().to_string(),
-                    contact_ids: ids_from_associations(&item["associations"]["contacts"]),
+                    contact_ids: Vec::new(),
                     thread_ids: Vec::new(),
                 });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
             }
             match data["paging"]["next"]["after"].as_str() {
                 Some(cursor) => after = Some(cursor.to_string()),
-                None => break,
+                None => return Ok(out),
             }
         }
-        Ok(out)
+    }
+
+    /// Contact ids per ticket, in batches rather than one call each.
+    pub async fn ticket_contacts(
+        &self,
+        ticket_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut map = std::collections::HashMap::new();
+        for chunk in ticket_ids.chunks(100) {
+            let payload = serde_json::json!({
+                "inputs": chunk.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
+            });
+            let data = self.post("/crm/v4/associations/tickets/contacts/batch/read", &payload).await?;
+            for row in data["results"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                let from = row["from"]["id"].as_str().unwrap_or_default().to_string();
+                let to: Vec<String> = row["to"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| {
+                        t["toObjectId"]
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| t["toObjectId"].as_i64().map(|n| n.to_string()))
+                    })
+                    .collect();
+                if !from.is_empty() {
+                    map.insert(from, to);
+                }
+            }
+        }
+        Ok(map)
     }
 
     /// Contacts in one request rather than one each.

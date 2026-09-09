@@ -365,7 +365,11 @@ impl Engine {
 
         let stages = client.stages_of(&pipeline).await;
         self.note_hubspot(&stages);
-        if let Ok(stages) = stages {
+        let closed_stages: Vec<String> = stages
+            .as_ref()
+            .map(|s| s.iter().filter(|s| s.closed).map(|s| s.id.clone()).collect())
+            .unwrap_or_default();
+        if let Ok(stages) = &stages {
             let folders: Vec<Folder> = stages
                 .iter()
                 .map(|s| Folder {
@@ -380,7 +384,8 @@ impl Engine {
             }
         }
 
-        let tickets = client.tickets_in_pipeline(&pipeline, 6).await;
+        // Every open ticket, plus a slice of recent closed ones.
+        let tickets = client.tickets_for_pipeline(&pipeline, &closed_stages, 200).await;
         self.note_hubspot(&tickets);
         let Ok(tickets) = tickets else {
             self.status.syncing = false;
