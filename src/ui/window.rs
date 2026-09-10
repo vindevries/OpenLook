@@ -1364,6 +1364,54 @@ pub fn reload_messages(state: &Rc<State>) {
     state.count_label.set_text(&format!("Items: {total}    Unread: {unread}"));
 }
 
+/// Show or hide one conversation's messages, touching only its own rows.
+/// Rebuilding the list here would mean re-creating every row in the folder —
+/// hundreds of widgets — for a click that changes a handful.
+fn toggle_conversation(state: &Rc<State>, conversation_id: &str) -> bool {
+    let Some((session_index, folder_id)) = state.current.borrow().clone() else { return false };
+    let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else {
+        return false;
+    };
+    let Some(position) = state.entries.borrow().iter().position(|entry| {
+        matches!(entry, ListEntry::Conversation(c) if c.conversation_id == conversation_id)
+    }) else {
+        return false;
+    };
+
+    let expanding = !state.expanded.borrow().contains(conversation_id);
+    state.rebuilding.set(true);
+    if expanding {
+        state.expanded.borrow_mut().insert(conversation_id.to_string());
+        let mut thread = db.conversation_messages(&folder_id, conversation_id).unwrap_or_default();
+        // Newest first, matching the order of the list around it.
+        thread.reverse();
+        for (offset, message) in thread.into_iter().enumerate() {
+            let mut summary = message.summary;
+            summary.thread_count = 1;
+            let row = message_row(state, &summary, session_index, true);
+            let at = position + 1 + offset;
+            state.message_list.insert(&row, at as i32);
+            state.entries.borrow_mut().insert(at, ListEntry::Message(summary));
+        }
+    } else {
+        state.expanded.borrow_mut().remove(conversation_id);
+        // The children are the plain messages sitting directly beneath.
+        let mut children = 0;
+        while matches!(state.entries.borrow().get(position + 1 + children), Some(ListEntry::Message(_)))
+        {
+            children += 1;
+        }
+        for _ in 0..children {
+            if let Some(row) = state.message_list.row_at_index((position + 1) as i32) {
+                state.message_list.remove(&row);
+            }
+            state.entries.borrow_mut().remove(position + 1);
+        }
+    }
+    state.rebuilding.set(false);
+    expanding
+}
+
 fn date_header_row(title: &str) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_selectable(false);
@@ -1435,14 +1483,14 @@ fn message_row(
         arrow.add_css_class("thread-arrow");
         let s = state.clone();
         let conversation = message.conversation_id.clone();
-        arrow.connect_clicked(move |_| {
-            {
-                let mut expanded = s.expanded.borrow_mut();
-                if !expanded.remove(&conversation) {
-                    expanded.insert(conversation.clone());
-                }
-            }
-            reload_messages(&s);
+        arrow.connect_clicked(move |button| {
+            let open = toggle_conversation(&s, &conversation);
+            button.set_icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" });
+            button.set_tooltip_text(Some(if open {
+                "Collapse conversation"
+            } else {
+                "Expand conversation"
+            }));
         });
         line.append(&arrow);
     }
