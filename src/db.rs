@@ -11,7 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::graph::folder_rank;
 use crate::model::{
-    Address, Body, CalendarEvent, Folder, MessageDetail, MessagePatch, MessageSummary, Op, Pending,
+    Address, Attachment, Body, CalendarEvent, Folder, MessageDetail, MessagePatch, MessageSummary,
+    Op, Pending,
 };
 use crate::util::now_unix;
 
@@ -41,6 +42,17 @@ CREATE TABLE IF NOT EXISTS messages (
     pending         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder_id, received DESC);
+CREATE TABLE IF NOT EXISTS attachments (
+    message_id   TEXT NOT NULL,
+    id           TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT '',
+    size         INTEGER NOT NULL DEFAULT 0,
+    is_inline    INTEGER NOT NULL DEFAULT 0,
+    -- where the bytes were saved, once someone opened it
+    path         TEXT,
+    PRIMARY KEY (message_id, id)
+);
 CREATE TABLE IF NOT EXISTS outbox (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     kind       TEXT NOT NULL,
@@ -525,7 +537,83 @@ impl Db {
     }
 
     pub fn remove_message(&self, id: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        let conn = self.conn();
+        conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        conn.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // -- attachments -----------------------------------------------------
+
+    /// Record what a message carries. Anything already downloaded keeps
+    /// its file, so re-reading a message does not lose it.
+    pub fn set_attachments(&self, message_id: &str, items: &[Attachment]) -> Result<()> {
+        let conn = self.conn();
+        for item in items {
+            conn.execute(
+                "INSERT INTO attachments (message_id, id, name, content_type, size, is_inline)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(message_id, id) DO UPDATE SET
+                     name = excluded.name,
+                     content_type = excluded.content_type,
+                     size = excluded.size,
+                     is_inline = excluded.is_inline",
+                params![
+                    message_id,
+                    item.id,
+                    item.name,
+                    item.content_type,
+                    item.size,
+                    item.is_inline as i64,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The files a message carries, in the order the server listed them.
+    pub fn attachments(&self, message_id: &str) -> Result<Vec<Attachment>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, content_type, size, is_inline, path
+               FROM attachments WHERE message_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![message_id], |r| {
+            Ok(Attachment {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                content_type: r.get(2)?,
+                size: r.get(3)?,
+                is_inline: r.get::<_, i64>(4)? != 0,
+                path: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn attachment(&self, message_id: &str, id: &str) -> Option<Attachment> {
+        self.attachments(message_id).ok()?.into_iter().find(|a| a.id == id)
+    }
+
+    /// Note where an attachment's bytes were saved.
+    pub fn set_attachment_path(&self, message_id: &str, id: &str, path: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE attachments SET path = ?3 WHERE message_id = ?1 AND id = ?2",
+            params![message_id, id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Mark the pictures that were embedded in the body: they are part of
+    /// the message as it reads, not files to open separately.
+    pub fn mark_attachments_inline(&self, message_id: &str, ids: &[String]) -> Result<()> {
+        let conn = self.conn();
+        for id in ids {
+            conn.execute(
+                "UPDATE attachments SET is_inline = 1 WHERE message_id = ?1 AND id = ?2",
+                params![message_id, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -680,6 +768,10 @@ impl Db {
         )?;
         conn.execute(
             "UPDATE outbox SET message_id = ?2 WHERE message_id = ?1",
+            params![old_id, new_id],
+        )?;
+        conn.execute(
+            "UPDATE OR REPLACE attachments SET message_id = ?2 WHERE message_id = ?1",
             params![old_id, new_id],
         )?;
         Ok(())

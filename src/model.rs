@@ -48,6 +48,20 @@ pub enum Pending {
     Queued,
 }
 
+/// A file carried by a message. The bytes are downloaded only when
+/// someone opens it; `path` is where they were saved.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size: i64,
+    /// Part of the body rather than a file to open — a signature logo or
+    /// a pasted screenshot, already shown in the message itself.
+    pub is_inline: bool,
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageSummary {
     pub id: String,

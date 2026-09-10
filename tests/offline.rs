@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use openlook::db::Db;
-use openlook::model::{MessagePatch, Op, Outgoing};
+use openlook::model::{Attachment, MessagePatch, Op, Outgoing};
 use openlook::sync::apply_local;
 
 fn temp_db(name: &str) -> (Db, PathBuf) {
@@ -341,4 +341,114 @@ fn unrelated_mail_stays_one_row_each() {
         "the rest stand alone"
     );
     cleanup(&path);
+}
+
+#[test]
+fn an_attachment_follows_its_message_through_a_server_move() {
+    let (db, path) = temp_db("attachments-move");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let msg = db.messages(&inbox, "").unwrap().remove(0);
+    db.set_attachments(
+        &msg.id,
+        &[Attachment {
+            id: "att-1".into(),
+            name: "Quote.pdf".into(),
+            content_type: "application/pdf".into(),
+            size: 2048,
+            is_inline: false,
+            path: None,
+        }],
+    )
+    .unwrap();
+    db.set_attachment_path(&msg.id, "att-1", "/tmp/Quote.pdf").unwrap();
+
+    // Archiving moves the message on the server, which renames it. The
+    // downloaded file has to stay reachable from the message that carries
+    // it, or opening it would download the whole thing again.
+    db.rename_message(&msg.id, "moved-id").unwrap();
+    let moved = db.attachments("moved-id").unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].name, "Quote.pdf");
+    assert_eq!(moved[0].path.as_deref(), Some("/tmp/Quote.pdf"));
+    assert!(db.attachments(&msg.id).unwrap().is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn re_reading_a_message_keeps_the_file_it_already_downloaded() {
+    let (db, path) = temp_db("attachments-keep");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let msg = db.messages(&inbox, "").unwrap().remove(0);
+    let listed = Attachment {
+        id: "att-1".into(),
+        name: "Quote.pdf".into(),
+        content_type: "application/pdf".into(),
+        size: 2048,
+        is_inline: false,
+        path: None,
+    };
+    db.set_attachments(&msg.id, std::slice::from_ref(&listed)).unwrap();
+    db.set_attachment_path(&msg.id, "att-1", "/tmp/Quote.pdf").unwrap();
+
+    // The server lists the same attachment again on the next open.
+    db.set_attachments(&msg.id, std::slice::from_ref(&listed)).unwrap();
+    let after = db.attachments(&msg.id).unwrap();
+    assert_eq!(after[0].path.as_deref(), Some("/tmp/Quote.pdf"), "download is not thrown away");
+    cleanup(&path);
+}
+
+#[test]
+fn a_picture_embedded_in_the_body_is_not_offered_as_a_file() {
+    let (db, path) = temp_db("attachments-inline");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let msg = db.messages(&inbox, "").unwrap().remove(0);
+    db.set_attachments(
+        &msg.id,
+        &[
+            Attachment {
+                id: "logo".into(),
+                name: "image001.png".into(),
+                content_type: "image/png".into(),
+                size: 4096,
+                is_inline: false,
+                path: None,
+            },
+            Attachment {
+                id: "quote".into(),
+                name: "Quote.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 2048,
+                is_inline: false,
+                path: None,
+            },
+        ],
+    )
+    .unwrap();
+
+    // Outlook marks a signature logo as not inline, so what settles it is
+    // the body having referred to it — once embedded, it is not a file.
+    db.mark_attachments_inline(&msg.id, &["logo".to_string()]).unwrap();
+    let offered: Vec<String> = db
+        .attachments(&msg.id)
+        .unwrap()
+        .into_iter()
+        .filter(|a| !a.is_inline)
+        .map(|a| a.name)
+        .collect();
+    assert_eq!(offered, vec!["Quote.pdf".to_string()]);
+    cleanup(&path);
+}
+
+#[test]
+fn an_attachment_name_cannot_escape_its_directory() {
+    // Names come from mail, so they are attacker-controlled: a name has
+    // to stay one name, inside the directory it was given.
+    for hostile in ["../../.bashrc", "/etc/passwd", "..", "sub/dir/file.pdf", ""] {
+        let safe = openlook::util::safe_name(hostile);
+        assert!(!safe.is_empty(), "{hostile:?} left no name");
+        assert!(!safe.contains('/'), "{hostile:?} kept a path separator");
+        assert!(safe != ".." && safe != ".", "{hostile:?} still points elsewhere");
+    }
+    // Ordinary names are left alone.
+    assert_eq!(openlook::util::safe_name("Quote 2026.pdf"), "Quote 2026.pdf");
 }

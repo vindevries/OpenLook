@@ -209,6 +209,33 @@ pub fn cid_references(html: &str) -> std::collections::HashSet<String> {
 ///
 /// Content ids appear in mail both bare and wrapped in angle brackets, and
 /// the reference in the HTML may be either form, so both are matched.
+/// A short, stable, filesystem-safe stand-in for a long opaque id.
+/// Graph attachment ids are hundreds of characters, which makes an ugly
+/// directory name and can overrun path limits; this keeps them apart
+/// without carrying the whole thing around. FNV-1a, so the same id maps
+/// to the same directory in every version.
+pub fn short_key(id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// A name safe to use as a file name: no separators, no traversal, and
+/// short enough for any filesystem. Attachment names come from mail, so
+/// they are attacker-controlled.
+pub fn safe_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " .-_()[]".contains(c) { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_string();
+    let cleaned = if cleaned.is_empty() { "attachment".to_string() } else { cleaned };
+    cleaned.chars().take(120).collect()
+}
+
 pub fn inline_cid_images(html: &str, images: &[(String, String, String)]) -> String {
     let mut out = html.to_string();
     for (content_id, content_type, base64) in images {

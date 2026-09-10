@@ -139,6 +139,13 @@ pub fn db_path(account_key: &str) -> PathBuf {
     data_dir().join(format!("{account_key}.db"))
 }
 
+/// Downloaded attachments, one directory per mailbox. They are kept
+/// rather than put in /tmp so an attachment opened once is still there
+/// when the same mail is opened on a train with no signal.
+pub fn attachments_dir(account_key: &str) -> PathBuf {
+    data_dir().join("attachments").join(account_key)
+}
+
 /// Filesystem-safe key for an account name.
 pub fn account_key(username: &str) -> String {
     if username.is_empty() {

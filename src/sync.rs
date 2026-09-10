@@ -18,7 +18,7 @@ use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
 use crate::hubspot::HubSpot;
 use crate::model::{AccountInfo, Address, Body, Folder, MessageSummary, Op, Pending, Status};
-use crate::util::now_unix;
+use crate::util::{now_unix, safe_name, short_key};
 
 /// How many messages the first sync of a folder pulls down.
 const WINDOW: u32 = 100;
@@ -55,13 +55,39 @@ pub fn runtime() -> &'static Runtime {
 /// referenced pictures and inline them, so a body renders the same offline
 /// as it does online. This is the only way bodies are fetched, so mail read
 /// straight from the cache is complete too.
-async fn fetch_body(graph: &Graph, id: &str) -> Result<(Vec<Address>, Vec<Address>, Body), GraphError> {
+async fn fetch_body(
+    graph: &Graph,
+    db: &Db,
+    id: &str,
+) -> Result<(Vec<Address>, Vec<Address>, Body), GraphError> {
     let (to, cc, mut body) = graph.detail(id).await?;
+    // The list is what the reading pane offers to open, so record it even
+    // when the body refers to none of it.
+    let items = match graph.attachments(id).await {
+        Ok(items) => {
+            let _ = db.set_attachments(id, &items);
+            items
+        }
+        // Losing the list is better than losing the message.
+        Err(e) => {
+            eprintln!("openlook: attachments: {e}");
+            Vec::new()
+        }
+    };
     if body.content.contains("cid:") {
         let wanted = crate::util::cid_references(&body.content);
-        match graph.inline_images(id, &wanted, INLINE_IMAGE_BUDGET).await {
-            Ok(images) => body.content = crate::util::inline_cid_images(&body.content, &images),
-            // Losing the pictures is better than losing the message.
+        match graph.inline_images(id, &items, &wanted, INLINE_IMAGE_BUDGET).await {
+            Ok(images) => {
+                // A picture embedded in the body is part of the message as
+                // it reads, not a file to offer separately.
+                let embedded: Vec<String> = images.iter().map(|i| i.1.clone()).collect();
+                let _ = db.mark_attachments_inline(id, &embedded);
+                let images: Vec<(String, String, String)> = images
+                    .into_iter()
+                    .map(|(content_id, _, content_type, bytes)| (content_id, content_type, bytes))
+                    .collect();
+                body.content = crate::util::inline_cid_images(&body.content, &images);
+            }
             Err(e) => eprintln!("openlook: inline images: {e}"),
         }
     }
@@ -103,6 +129,10 @@ pub enum Cmd {
     SyncFolder(String),
     /// Make sure a message body is cached, downloading it if needed.
     OpenMessage(String),
+    /// Make sure the list of what a message carries is cached.
+    ListAttachments(String),
+    /// Download an attachment if it is not already on disk, ready to open.
+    OpenAttachment { message_id: String, attachment_id: String },
     /// Make sure an appointment's body is cached.
     OpenEvent(String),
     /// Refresh the calendar for a window, given as RFC3339 UTC bounds.
@@ -117,6 +147,10 @@ pub enum Event {
     FoldersChanged,
     MessagesChanged(String),
     BodyReady(String),
+    /// The list of files a message carries has arrived.
+    AttachmentsChanged(String),
+    /// An attachment is on disk at this path, ready to be opened.
+    AttachmentReady { message_id: String, attachment_id: String, path: String },
     CalendarChanged,
     EventReady(String),
     StatusChanged(Status),
@@ -163,6 +197,7 @@ impl Session {
             status: Status::default(),
             last_folder: None,
             label: mode.label(),
+            key: mode.key(),
         };
         runtime().spawn(engine.run(cmd_rx));
         Ok(Session { db, mode, cmd_tx, events })
@@ -280,6 +315,8 @@ struct Engine {
     last_folder: Option<String>,
     /// Which mailbox this engine serves, for error messages.
     label: String,
+    /// Filesystem-safe name for this mailbox, for its downloads.
+    key: String,
 }
 
 impl Engine {
@@ -334,6 +371,10 @@ impl Engine {
                 }
             }
             Cmd::OpenMessage(id) => self.ensure_body(&id).await,
+            Cmd::ListAttachments(id) => self.ensure_attachment_list(&id).await,
+            Cmd::OpenAttachment { message_id, attachment_id } => {
+                self.ensure_attachment(&message_id, &attachment_id).await
+            }
             Cmd::SyncCalendar { start, end } => self.sync_calendar(&start, &end).await,
             Cmd::OpenEvent(id) => self.ensure_event_body(&id).await,
             Cmd::Flush => {
@@ -712,7 +753,7 @@ impl Engine {
                 let db = self.db.clone();
                 let id = id.clone();
                 set.spawn(async move {
-                    match fetch_body(&graph, &id).await {
+                    match fetch_body(&graph, &db, &id).await {
                         Ok((to, cc, body)) => {
                             let _ = db.set_body(&id, &body, &to, &cc);
                             Ok(id)
@@ -755,7 +796,7 @@ impl Engine {
             self.emit(Event::Failed("This message is not available offline.".into()));
             return;
         };
-        let detail = fetch_body(&graph, id).await;
+        let detail = fetch_body(&graph, &self.db, id).await;
         self.note_result(&detail);
         match detail {
             Ok((to, cc, body)) => {
@@ -771,6 +812,77 @@ impl Engine {
             }
             Err(e) => self.emit(Event::Failed(e.to_string())),
         }
+    }
+
+    /// Mail cached before attachments were listed carries none in the
+    /// cache, and its body is already downloaded, so nothing would fetch
+    /// the list. Fetch it once, on the message the reading pane shows.
+    async fn ensure_attachment_list(&mut self, message_id: &str) {
+        if self.db.attachments(message_id).map(|a| !a.is_empty()).unwrap_or(false) {
+            return;
+        }
+        let Some(graph) = self.backend.mail() else { return };
+        let items = graph.attachments(message_id).await;
+        self.note_result(&items);
+        if let Ok(items) = items {
+            if self.db.set_attachments(message_id, &items).is_ok() && !items.is_empty() {
+                self.emit(Event::AttachmentsChanged(message_id.to_string()));
+            }
+        }
+    }
+
+    /// Put an attachment on disk so the desktop can open it. Already
+    /// downloaded, it is served straight from the cache — which is what
+    /// makes an attachment readable again with no network.
+    async fn ensure_attachment(&mut self, message_id: &str, attachment_id: &str) {
+        let Some(item) = self.db.attachment(message_id, attachment_id) else {
+            self.emit(Event::Failed("That attachment is no longer listed.".into()));
+            return;
+        };
+        if let Some(path) = item.path.filter(|p| std::path::Path::new(p).exists()) {
+            self.emit(Event::AttachmentReady {
+                message_id: message_id.to_string(),
+                attachment_id: attachment_id.to_string(),
+                path,
+            });
+            return;
+        }
+        let Some(graph) = self.backend.mail() else {
+            self.emit(Event::Failed("Attachments need a signed-in mailbox.".into()));
+            return;
+        };
+        let bytes = graph.attachment_bytes(message_id, attachment_id).await;
+        self.note_result(&bytes);
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(e) if e.is_offline() => {
+                self.publish_status();
+                self.emit(Event::Failed(
+                    "That attachment hasn't been downloaded yet, and you're offline.".into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                self.emit(Event::Failed(e.to_string()));
+                return;
+            }
+        };
+        // One directory per attachment, so two files of the same name on
+        // different mail cannot overwrite one another.
+        let dir = crate::config::attachments_dir(&self.key).join(short_key(attachment_id));
+        let path = dir.join(safe_name(&item.name));
+        let written = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes));
+        if let Err(e) = written {
+            self.emit(Event::Failed(format!("Could not save the attachment: {e}")));
+            return;
+        }
+        let path = path.to_string_lossy().to_string();
+        let _ = self.db.set_attachment_path(message_id, attachment_id, &path);
+        self.emit(Event::AttachmentReady {
+            message_id: message_id.to_string(),
+            attachment_id: attachment_id.to_string(),
+            path,
+        });
     }
 
     /// A server-side move renames the message; keep the cache in step so a

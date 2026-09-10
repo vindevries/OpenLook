@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::auth::Auth;
 use crate::model::{
-    Address, Body, CalendarEvent, Folder, MessagePatch, MessageSummary, Outgoing, Pending, SendMode,
+    Address, Attachment, Body, CalendarEvent, Folder, MessagePatch, MessageSummary, Outgoing,
+    Pending, SendMode,
 };
 use crate::util::html_to_text;
 
@@ -173,6 +174,19 @@ impl Graph {
     async fn get(&self, url: &str) -> GraphResult<Value> {
         let url = if url.starts_with("http") { url.to_string() } else { format!("{GRAPH}{url}") };
         self.send(self.http.get(url)).await?.ok_or_else(|| GraphError::Transient("Empty response".into()))
+    }
+
+    /// A response that is a file rather than JSON.
+    async fn get_bytes(&self, url: &str) -> GraphResult<Vec<u8>> {
+        let url = if url.starts_with("http") { url.to_string() } else { format!("{GRAPH}{url}") };
+        let token = self.token().await?;
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            // Reuse the JSON path's classification of the failure.
+            self.read(resp).await?;
+            return Err(GraphError::Transient("Empty response".into()));
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 
     async fn get_paged(&self, url: &str, page_size: u32) -> GraphResult<Value> {
@@ -406,18 +420,10 @@ impl Graph {
     /// own, so they render as broken images until the bytes are fetched and
     /// inlined. Only inline parts are downloaded, and only up to a size
     /// worth embedding.
-    pub async fn inline_images(
-        &self,
-        message_id: &str,
-        wanted: &std::collections::HashSet<String>,
-        max_bytes: i64,
-    ) -> GraphResult<Vec<(String, String, String)>> {
-        if wanted.is_empty() {
-            return Ok(Vec::new());
-        }
-        // contentId lives on fileAttachment, not on the base attachment
-        // type, so asking for it in $select is rejected outright. List the
-        // shared fields instead and read contentId off each candidate.
+    /// What a message carries. contentId lives on fileAttachment rather
+    /// than on the base attachment type, so asking for it in $select is
+    /// rejected outright — it is read per item where it is needed.
+    pub async fn attachments(&self, message_id: &str) -> GraphResult<Vec<Attachment>> {
         let list = self
             .get(&format!(
                 "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
@@ -425,40 +431,80 @@ impl Graph {
             ))
             .await?;
         let mut out = Vec::new();
-        let mut budget = max_bytes;
         for item in list["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+            let Some(id) = item["id"].as_str() else { continue };
+            let name = item["name"].as_str().unwrap_or("Attachment");
+            let declared = item["contentType"].as_str().unwrap_or_default();
+            out.push(Attachment {
+                id: id.to_string(),
+                name: name.to_string(),
+                content_type: if declared.is_empty() {
+                    guess_image_type(name)
+                } else {
+                    declared.to_string()
+                },
+                size: item["size"].as_i64().unwrap_or(0),
+                is_inline: item["isInline"].as_bool().unwrap_or(false),
+                path: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The bytes of one attachment.
+    pub async fn attachment_bytes(&self, message_id: &str, id: &str) -> GraphResult<Vec<u8>> {
+        self.get_bytes(&format!(
+            "/me/messages/{}/attachments/{}/$value",
+            urlencoding::encode(message_id),
+            urlencoding::encode(id)
+        ))
+        .await
+    }
+
+    /// The pictures a body refers to by `cid:`, as
+    /// (content id, attachment id, content type, base64). Only attachments
+    /// the body actually names are fetched, within a byte budget, and
+    /// isInline is deliberately not the test: Outlook routinely marks a
+    /// referenced picture as not inline.
+    pub async fn inline_images(
+        &self,
+        message_id: &str,
+        items: &[Attachment],
+        wanted: &std::collections::HashSet<String>,
+        max_bytes: i64,
+    ) -> GraphResult<Vec<(String, String, String, String)>> {
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut budget = max_bytes;
+        for item in items {
             if out.len() == wanted.len() {
                 break;
             }
-            let name = item["name"].as_str().unwrap_or_default();
-            let declared = item["contentType"].as_str().unwrap_or_default();
-            let content_type =
-                if declared.is_empty() { guess_image_type(name) } else { declared.to_string() };
-            if !content_type.starts_with("image/") {
+            if !item.content_type.starts_with("image/") || item.size > budget {
                 continue;
             }
-            let size = item["size"].as_i64().unwrap_or(0);
-            if size > budget {
-                continue;
-            }
-            let Some(id) = item["id"].as_str() else { continue };
             let single = self
                 .get(&format!(
                     "/me/messages/{}/attachments/{}",
                     urlencoding::encode(message_id),
-                    urlencoding::encode(id)
+                    urlencoding::encode(&item.id)
                 ))
                 .await?;
             let content_id = single["contentId"].as_str().unwrap_or_default();
             let bare = content_id.trim_matches(|c| c == '<' || c == '>');
-            // Match what the body actually refers to. Outlook often marks a
-            // referenced picture as not inline, so isInline is no guide.
             if bare.is_empty() || !wanted.contains(bare) {
                 continue;
             }
             let Some(bytes) = single["contentBytes"].as_str() else { continue };
-            budget -= size;
-            out.push((bare.to_string(), content_type, bytes.to_string()));
+            budget -= item.size;
+            out.push((
+                bare.to_string(),
+                item.id.clone(),
+                item.content_type.clone(),
+                bytes.to_string(),
+            ));
         }
         Ok(out)
     }

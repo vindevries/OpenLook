@@ -113,6 +113,12 @@ const CSS: &str = r#"
   border-radius: 6px;
 }
 
+.attachment-chip {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 0.9em;
+}
+
 /* Calendar */
 .view-rail button { min-width: 34px; padding: 6px; }
 .cal-weekday {

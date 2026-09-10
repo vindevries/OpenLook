@@ -16,7 +16,7 @@ use webkit::prelude::*;
 
 use crate::auth::Auth;
 use crate::model::{
-    AccountInfo, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode, Status,
+    AccountInfo, Attachment, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode, Status,
 };
 use crate::sync::{runtime, Cmd, Event, Mode, Session};
 use crate::ui::compose::ComposeWindow;
@@ -120,6 +120,8 @@ pub struct State {
     to_label: gtk::Label,
     date_label: gtk::Label,
     pending_label: gtk::Label,
+    /// One button per file the open message carries.
+    attachment_bar: gtk::FlowBox,
     read_toggle: gtk::Button,
     filter_unread: gtk::ToggleButton,
     thread_toggle: gtk::ToggleButton,
@@ -128,6 +130,8 @@ pub struct State {
     count_label: gtk::Label,
     connection_label: gtk::Label,
     pub calendar: crate::ui::calendar::CalendarUi,
+    /// The attachment the user asked for, waiting on its download.
+    opening_attachment: RefCell<Option<(String, String)>>,
     /// Appointment windows currently open, so a body can be filled in.
     pub appointments: RefCell<Vec<crate::ui::calendar::AppointmentWindow>>,
     view_stack: gtk::Stack,
@@ -487,6 +491,17 @@ pub fn build(app: &adw::Application) {
     pending_label.add_css_class("queued-chip");
     head.append(&pending_label);
 
+    let attachment_bar = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(6)
+        .row_spacing(6)
+        .margin_top(6)
+        .max_children_per_line(6)
+        .visible(false)
+        .build();
+    attachment_bar.add_css_class("attachment-bar");
+    head.append(&attachment_bar);
+
     reader.append(&head);
     reader.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -624,6 +639,7 @@ pub fn build(app: &adw::Application) {
         to_label,
         date_label,
         pending_label,
+        attachment_bar,
         read_toggle,
         filter_unread,
         thread_toggle,
@@ -632,6 +648,7 @@ pub fn build(app: &adw::Application) {
         count_label,
         connection_label,
         calendar,
+        opening_attachment: RefCell::new(None),
         appointments: RefCell::new(Vec::new()),
         view_stack,
         #[cfg(feature = "html-view")]
@@ -969,6 +986,23 @@ pub fn listen(state: &Rc<State>, index: usize) {
                         if let Some(Ok(Some(detail))) = db.map(|db| db.message(&id)) {
                             render_body(&state, &detail);
                         }
+                    }
+                }
+                Event::AttachmentsChanged(id) => {
+                    let showing = state.current_message.borrow().as_deref() == Some(id.as_str());
+                    if showing {
+                        let db = state.sessions.borrow().get(index).map(|s| s.db.clone());
+                        if let Some(Ok(Some(detail))) = db.map(|db| db.message(&id)) {
+                            render_attachments(&state, &detail.summary);
+                        }
+                    }
+                }
+                Event::AttachmentReady { message_id, attachment_id, path } => {
+                    let asked_for = state.opening_attachment.borrow().as_ref()
+                        == Some(&(message_id.clone(), attachment_id.clone()));
+                    if asked_for {
+                        *state.opening_attachment.borrow_mut() = None;
+                        launch_file(&state, &path);
                     }
                 }
                 Event::StatusChanged(status) => {
@@ -1621,10 +1655,133 @@ fn show_conversation(state: &Rc<State>, thread: &[MessageDetail]) {
     render_thread(state, thread);
 }
 
+fn clear_attachments(state: &Rc<State>) {
+    while let Some(child) = state.attachment_bar.first_child() {
+        state.attachment_bar.remove(&child);
+    }
+    state.attachment_bar.set_visible(false);
+}
+
+/// A button per file the message carries. Pictures that the body embeds
+/// are left out: they are already on screen, and listing every signature
+/// logo would bury the one file that matters.
+fn render_attachments(state: &Rc<State>, summary: &MessageSummary) {
+    clear_attachments(state);
+    let session_index = state.active_session();
+    let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
+    let items: Vec<Attachment> = db
+        .attachments(&summary.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.is_inline)
+        .collect();
+    if items.is_empty() {
+        // Mail cached before attachments were listed has none recorded;
+        // ask for the list, and the bar fills in when it arrives.
+        if summary.has_attachments {
+            if let Some(session) = state.sessions.borrow().get(session_index) {
+                session.send(Cmd::ListAttachments(summary.id.clone()));
+            }
+        }
+        return;
+    }
+    for item in items {
+        let button = gtk::Button::builder()
+            .tooltip_text(format!("Open {}", item.name))
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(attachment_icon(&item.content_type))
+                    .label(&format!("{}  ({})", item.name, fmt_size(item.size)))
+                    .build(),
+            )
+            .build();
+        button.add_css_class("attachment-chip");
+        let state_for_click = state.clone();
+        let message_id = summary.id.clone();
+        let attachment_id = item.id.clone();
+        button.connect_clicked(move |_| {
+            open_attachment(&state_for_click, &message_id, &attachment_id);
+        });
+        state.attachment_bar.insert(&button, -1);
+    }
+    state.attachment_bar.set_visible(true);
+}
+
+fn attachment_icon(content_type: &str) -> &'static str {
+    match content_type {
+        t if t.starts_with("image/") => "image-x-generic-symbolic",
+        t if t.starts_with("audio/") => "audio-x-generic-symbolic",
+        t if t.starts_with("video/") => "video-x-generic-symbolic",
+        t if t.starts_with("text/") => "text-x-generic-symbolic",
+        t if t.contains("spreadsheet") || t.contains("excel") => "x-office-spreadsheet-symbolic",
+        t if t.contains("presentation") || t.contains("powerpoint") => {
+            "x-office-presentation-symbolic"
+        }
+        t if t == "application/pdf" || t.contains("word") || t.contains("opendocument.text") => {
+            "x-office-document-symbolic"
+        }
+        t if t.contains("zip") || t.contains("compressed") => "package-x-generic-symbolic",
+        _ => "mail-attachment-symbolic",
+    }
+}
+
+fn fmt_size(bytes: i64) -> String {
+    match bytes {
+        b if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+        b if b >= 1024 => format!("{} KB", b / 1024),
+        b => format!("{b} bytes"),
+    }
+}
+
+/// Open an attachment with whatever the desktop uses for its type,
+/// downloading it first if this is the first time it has been opened.
+fn open_attachment(state: &Rc<State>, message_id: &str, attachment_id: &str) {
+    let session_index = state.active_session();
+    let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
+    if let Some(path) = db
+        .attachment(message_id, attachment_id)
+        .and_then(|item| item.path)
+        .filter(|path| std::path::Path::new(path).exists())
+    {
+        launch_file(state, &path);
+        return;
+    }
+    *state.opening_attachment.borrow_mut() =
+        Some((message_id.to_string(), attachment_id.to_string()));
+    if let Some(session) = state.sessions.borrow().get(session_index) {
+        session.send(Cmd::OpenAttachment {
+            message_id: message_id.to_string(),
+            attachment_id: attachment_id.to_string(),
+        });
+    }
+}
+
+fn launch_file(state: &Rc<State>, path: &str) {
+    let file = gio::File::for_path(path);
+    if gio::AppInfo::launch_default_for_uri(&file.uri(), gio::AppLaunchContext::NONE).is_ok() {
+        return;
+    }
+    // Nothing is installed for this kind of file. The download is still
+    // worth something, so show where it landed and open the folder it is
+    // in, which is as far as we can helpfully go.
+    let folder = file.parent().map(|dir| dir.uri()).unwrap_or_default();
+    let shown = gio::AppInfo::launch_default_for_uri(&folder, gio::AppLaunchContext::NONE).is_ok();
+    let name = file.basename().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    toast(
+        state,
+        &if shown {
+            format!("No app is installed for {name} — saved it and opened the folder")
+        } else {
+            format!("No app is installed for {name} — saved to {path}")
+        },
+    );
+}
+
 fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     let Some(detail) = detail else {
         *state.current_message.borrow_mut() = None;
         state.current_thread.borrow_mut().clear();
+        clear_attachments(state);
         state.reading.set_visible_child_name("empty");
         return;
     };
@@ -1666,6 +1823,7 @@ fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     }
 
     update_read_toggle(state, detail.summary.is_read);
+    render_attachments(state, &detail.summary);
     render_body(state, detail);
     state.reading.set_visible_child_name("message");
 }
