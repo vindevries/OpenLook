@@ -76,6 +76,16 @@ const CSS: &str = r#"
   font-size: 0.85em;
   opacity: 0.65;
 }
+.thread-arrow {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  margin-right: 2px;
+}
+.message-row.thread-child {
+  padding-left: 30px;
+  border-left-color: alpha(currentColor, 0.15);
+}
 .filter-tab {
   padding: 2px 10px;
   font-size: 0.9em;

@@ -66,6 +66,9 @@ enum PaneRow {
 enum ListEntry {
     /// A date separator; its text lives in the row widget.
     DateHeader,
+    /// A grouped conversation: opening it reads the whole exchange.
+    Conversation(MessageSummary),
+    /// One message: an ungrouped mail, or a child of an expanded thread.
     Message(MessageSummary),
 }
 
@@ -146,6 +149,8 @@ pub struct State {
     /// Ids of the messages in the conversation on show, so a body arriving
     /// for any of them refreshes the pane.
     current_thread: RefCell<Vec<String>>,
+    /// Conversations expanded in the list, by conversation id.
+    expanded: RefCell<HashSet<String>>,
     threaded: Cell<bool>,
     scope: Cell<Scope>,
     /// Selection is remembered per scope, so switching panes returns you
@@ -643,6 +648,7 @@ pub fn build(app: &adw::Application) {
         current: RefCell::new(None),
         current_message: RefCell::new(None),
         current_thread: RefCell::new(Vec::new()),
+        expanded: RefCell::new(HashSet::new()),
         threaded: Cell::new(crate::config::Settings::load().threaded()),
         scope: Cell::new(Scope::Mail),
         mail_selection: RefCell::new(None),
@@ -781,7 +787,9 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         }
         let Some(row) = row else { return };
         let summary = match s.entries.borrow().get(row.index() as usize) {
-            Some(ListEntry::Message(summary)) => summary.clone(),
+            Some(ListEntry::Conversation(summary)) | Some(ListEntry::Message(summary)) => {
+                summary.clone()
+            }
             _ => return,
         };
         open_message(&s, &summary);
@@ -1302,14 +1310,36 @@ pub fn reload_messages(state: &Rc<State>) {
             state.message_list.append(&date_header_row(&bucket));
             entries.push(ListEntry::DateHeader);
         }
-        state.message_list.append(&message_row(&message, session_index));
+        let threaded_row = state.threaded.get() && message.thread_count > 1;
+        state.message_list.append(&message_row(state, &message, session_index, false));
         if current.as_deref() == Some(message.id.as_str()) {
             select_index = Some(entries.len() as i32);
         }
-        entries.push(ListEntry::Message(message));
+        let conversation_id = message.conversation_id.clone();
+        let expanded = threaded_row && state.expanded.borrow().contains(&conversation_id);
+        entries.push(if threaded_row {
+            ListEntry::Conversation(message)
+        } else {
+            ListEntry::Message(message)
+        });
+        if expanded {
+            // Newest first, matching the order of the list above it.
+            let mut thread =
+                db.conversation_messages(&folder_id, &conversation_id).unwrap_or_default();
+            thread.reverse();
+            for message in thread {
+                let mut summary = message.summary;
+                summary.thread_count = 1;
+                state.message_list.append(&message_row(state, &summary, session_index, true));
+                entries.push(ListEntry::Message(summary));
+            }
+        }
     }
 
-    let shown = entries.iter().filter(|e| matches!(e, ListEntry::Message(_))).count();
+    let shown = entries
+        .iter()
+        .filter(|e| matches!(e, ListEntry::Message(_) | ListEntry::Conversation(_)))
+        .count();
     *state.entries.borrow_mut() = entries;
 
     // Putting the selection back is not the user opening the message, so it
@@ -1363,7 +1393,15 @@ fn parse_drag_payload(payload: &str) -> Option<(usize, &str)> {
     Some((session.parse().ok()?, id))
 }
 
-fn message_row(message: &MessageSummary, session: usize) -> gtk::ListBoxRow {
+/// A row in the message list. A conversation of several messages gets a
+/// disclosure arrow that expands the thread in place, as Outlook does; a
+/// child row is one message of an expanded thread.
+fn message_row(
+    state: &Rc<State>,
+    message: &MessageSummary,
+    session: usize,
+    child: bool,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
 
     // Drag a message onto a folder to move it.
@@ -1376,11 +1414,38 @@ fn message_row(message: &MessageSummary, session: usize) -> gtk::ListBoxRow {
 
     let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     row_box.add_css_class("message-row");
+    if child {
+        row_box.add_css_class("thread-child");
+    }
     if !message.is_read {
         row_box.add_css_class("unread");
     }
 
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+    // The arrow opens the thread in place. It is a button, so clicking it
+    // does not also select the row.
+    if message.thread_count > 1 {
+        let open = state.expanded.borrow().contains(&message.conversation_id);
+        let arrow = gtk::Button::builder()
+            .icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" })
+            .tooltip_text(if open { "Collapse conversation" } else { "Expand conversation" })
+            .build();
+        arrow.add_css_class("flat");
+        arrow.add_css_class("thread-arrow");
+        let s = state.clone();
+        let conversation = message.conversation_id.clone();
+        arrow.connect_clicked(move |_| {
+            {
+                let mut expanded = s.expanded.borrow_mut();
+                if !expanded.remove(&conversation) {
+                    expanded.insert(conversation.clone());
+                }
+            }
+            reload_messages(&s);
+        });
+        line.append(&arrow);
+    }
     let sender = gtk::Label::builder()
         .label(message.from.display())
         .xalign(0.0)
