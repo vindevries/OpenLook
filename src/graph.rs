@@ -400,6 +400,69 @@ impl Graph {
         Ok((body, attendees))
     }
 
+    /// Images embedded in a message, as (content id, mime type, base64).
+    ///
+    /// Mail refers to these with `cid:` URLs; nothing resolves those on its
+    /// own, so they render as broken images until the bytes are fetched and
+    /// inlined. Only inline parts are downloaded, and only up to a size
+    /// worth embedding.
+    pub async fn inline_images(
+        &self,
+        message_id: &str,
+        wanted: &std::collections::HashSet<String>,
+        max_bytes: i64,
+    ) -> GraphResult<Vec<(String, String, String)>> {
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        // contentId lives on fileAttachment, not on the base attachment
+        // type, so asking for it in $select is rejected outright. List the
+        // shared fields instead and read contentId off each candidate.
+        let list = self
+            .get(&format!(
+                "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
+                urlencoding::encode(message_id)
+            ))
+            .await?;
+        let mut out = Vec::new();
+        let mut budget = max_bytes;
+        for item in list["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+            if out.len() == wanted.len() {
+                break;
+            }
+            let name = item["name"].as_str().unwrap_or_default();
+            let declared = item["contentType"].as_str().unwrap_or_default();
+            let content_type =
+                if declared.is_empty() { guess_image_type(name) } else { declared.to_string() };
+            if !content_type.starts_with("image/") {
+                continue;
+            }
+            let size = item["size"].as_i64().unwrap_or(0);
+            if size > budget {
+                continue;
+            }
+            let Some(id) = item["id"].as_str() else { continue };
+            let single = self
+                .get(&format!(
+                    "/me/messages/{}/attachments/{}",
+                    urlencoding::encode(message_id),
+                    urlencoding::encode(id)
+                ))
+                .await?;
+            let content_id = single["contentId"].as_str().unwrap_or_default();
+            let bare = content_id.trim_matches(|c| c == '<' || c == '>');
+            // Match what the body actually refers to. Outlook often marks a
+            // referenced picture as not inline, so isInline is no guide.
+            if bare.is_empty() || !wanted.contains(bare) {
+                continue;
+            }
+            let Some(bytes) = single["contentBytes"].as_str() else { continue };
+            budget -= size;
+            out.push((bare.to_string(), content_type, bytes.to_string()));
+        }
+        Ok(out)
+    }
+
     /// Full message: recipients plus the body.
     pub async fn detail(&self, id: &str) -> GraphResult<(Vec<Address>, Vec<Address>, Body)> {
         let url = format!(
@@ -500,6 +563,25 @@ fn graph_time(v: &Value) -> String {
     } else {
         format!("{trimmed}Z")
     }
+}
+
+/// Fall back to the file extension when a part carries no content type.
+fn guess_image_type(name: &str) -> String {
+    let lower = name.to_lowercase();
+    for (suffix, mime) in [
+        (".png", "image/png"),
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".gif", "image/gif"),
+        (".bmp", "image/bmp"),
+        (".webp", "image/webp"),
+        (".svg", "image/svg+xml"),
+    ] {
+        if lower.ends_with(suffix) {
+            return mime.to_string();
+        }
+    }
+    "application/octet-stream".to_string()
 }
 
 fn parse_address(v: &Value) -> Address {

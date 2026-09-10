@@ -17,7 +17,7 @@ use crate::config::{account_key, db_path};
 use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
 use crate::hubspot::HubSpot;
-use crate::model::{AccountInfo, Body, Folder, MessageSummary, Op, Pending, Status};
+use crate::model::{AccountInfo, Address, Body, Folder, MessageSummary, Op, Pending, Status};
 use crate::util::now_unix;
 
 /// How many messages the first sync of a folder pulls down.
@@ -26,6 +26,10 @@ const WINDOW: u32 = 100;
 /// still letting a large folder finish its first enumeration over a few
 /// passes, after which each sync is a single cheap request.
 const DELTA_PAGES_PER_SYNC: usize = 10;
+/// Total bytes of embedded pictures worth storing with one message. A
+/// signature logo is a few kilobytes; a pasted screenshot can be far more,
+/// and the base64 of it lands in the cache.
+const INLINE_IMAGE_BUDGET: i64 = 4 * 1024 * 1024;
 /// How many bodies to prefetch per folder so mail is readable offline.
 const PREFETCH: usize = 40;
 /// Concurrent body downloads.
@@ -42,6 +46,26 @@ pub fn runtime() -> &'static Runtime {
             .build()
             .expect("failed to start async runtime")
     })
+}
+
+/// A message body with the pictures it carries embedded.
+///
+/// Mail refers to its own attachments as `cid:` URLs, which nothing outside
+/// the message can resolve — WebKit shows them as broken images. Fetch the
+/// referenced pictures and inline them, so a body renders the same offline
+/// as it does online. This is the only way bodies are fetched, so mail read
+/// straight from the cache is complete too.
+async fn fetch_body(graph: &Graph, id: &str) -> Result<(Vec<Address>, Vec<Address>, Body), GraphError> {
+    let (to, cc, mut body) = graph.detail(id).await?;
+    if body.content.contains("cid:") {
+        let wanted = crate::util::cid_references(&body.content);
+        match graph.inline_images(id, &wanted, INLINE_IMAGE_BUDGET).await {
+            Ok(images) => body.content = crate::util::inline_cid_images(&body.content, &images),
+            // Losing the pictures is better than losing the message.
+            Err(e) => eprintln!("openlook: inline images: {e}"),
+        }
+    }
+    Ok((to, cc, body))
 }
 
 #[derive(Debug, Clone)]
@@ -688,7 +712,7 @@ impl Engine {
                 let db = self.db.clone();
                 let id = id.clone();
                 set.spawn(async move {
-                    match graph.detail(&id).await {
+                    match fetch_body(&graph, &id).await {
                         Ok((to, cc, body)) => {
                             let _ = db.set_body(&id, &body, &to, &cc);
                             Ok(id)
@@ -723,15 +747,15 @@ impl Engine {
             self.ensure_ticket_body(id).await;
             return;
         }
-        let already = matches!(self.db.message(id), Ok(Some(m)) if m.body.is_some());
-        if already {
+        let cached = matches!(self.db.message(id), Ok(Some(m)) if m.body.is_some());
+        if cached {
             return;
         }
         let Some(graph) = self.backend.mail() else {
             self.emit(Event::Failed("This message is not available offline.".into()));
             return;
         };
-        let detail = graph.detail(id).await;
+        let detail = fetch_body(&graph, id).await;
         self.note_result(&detail);
         match detail {
             Ok((to, cc, body)) => {

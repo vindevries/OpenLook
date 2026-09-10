@@ -171,3 +171,120 @@ pub fn wrap_thread(
     }
     wrap_body(true, &content, dark)
 }
+
+/// The content ids a body refers to, without their angle brackets.
+pub fn cid_references(html: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let lower = html.to_lowercase();
+    let bytes: Vec<char> = html.chars().collect();
+    let lower: Vec<char> = lower.chars().collect();
+    let needle: Vec<char> = "cid:".chars().collect();
+    let mut i = 0;
+    while i + needle.len() < lower.len() {
+        if lower[i..i + needle.len()] == needle[..] {
+            let mut j = i + needle.len();
+            let mut id = String::new();
+            while j < bytes.len() {
+                let c = bytes[j];
+                // The reference ends at the quote or delimiter around it.
+                if c == '"' || c == '\'' || c == '>' || c == ' ' || c == ')' {
+                    break;
+                }
+                id.push(c);
+                j += 1;
+            }
+            let id = id.trim_matches(|c| c == '<' || c == '>').to_string();
+            if !id.is_empty() {
+                out.insert(id);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replace `cid:` image references with the bytes they refer to.
+///
+/// Content ids appear in mail both bare and wrapped in angle brackets, and
+/// the reference in the HTML may be either form, so both are matched.
+pub fn inline_cid_images(html: &str, images: &[(String, String, String)]) -> String {
+    let mut out = html.to_string();
+    for (content_id, content_type, base64) in images {
+        let bare = content_id.trim_matches(|c| c == '<' || c == '>');
+        if bare.is_empty() {
+            continue;
+        }
+        let data_uri = format!("data:{content_type};base64,{base64}");
+        for reference in [format!("cid:{bare}"), format!("cid:<{bare}>")] {
+            // Case-insensitive replace, since mail clients vary.
+            let mut rebuilt = String::with_capacity(out.len());
+            let mut rest = out.as_str();
+            let needle = reference.to_lowercase();
+            loop {
+                let lower = rest.to_lowercase();
+                match lower.find(&needle) {
+                    Some(at) => {
+                        rebuilt.push_str(&rest[..at]);
+                        rebuilt.push_str(&data_uri);
+                        rest = &rest[at + reference.len()..];
+                    }
+                    None => {
+                        rebuilt.push_str(rest);
+                        break;
+                    }
+                }
+            }
+            out = rebuilt;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod cid_tests {
+    use super::*;
+
+    fn image() -> (String, String, String) {
+        ("logo@example".into(), "image/png".into(), "AAAA".into())
+    }
+
+    #[test]
+    fn a_reference_becomes_the_image_itself() {
+        let html = r#"<p>hi</p><img src="cid:logo@example" width="10">"#;
+        let out = inline_cid_images(html, &[image()]);
+        assert!(out.contains("data:image/png;base64,AAAA"));
+        assert!(!out.contains("cid:"), "no dangling reference is left");
+        assert!(out.contains("width=\"10\""), "the rest of the tag survives");
+    }
+
+    #[test]
+    fn angle_brackets_and_case_are_tolerated() {
+        let html = r#"<img src="CID:<logo@example>">"#;
+        let out = inline_cid_images(html, &[image()]);
+        assert!(out.contains("data:image/png;base64,AAAA"));
+        assert!(!out.to_lowercase().contains("cid:"));
+    }
+
+    #[test]
+    fn references_are_found_whatever_their_wrapping() {
+        let html = r#"<img src="cid:a@x"><img src='CID:<b@y>'><img src="cid:c@z" alt="">"#;
+        let found = cid_references(html);
+        assert!(found.contains("a@x"), "plain reference");
+        assert!(found.contains("b@y"), "angle brackets stripped");
+        assert!(found.contains("c@z"), "stops at the quote");
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn a_body_without_pictures_asks_for_nothing() {
+        assert!(cid_references("<p>no pictures here</p>").is_empty());
+    }
+
+    #[test]
+    fn an_image_that_was_not_fetched_is_left_alone() {
+        let html = r#"<img src="cid:missing@example">"#;
+        assert_eq!(inline_cid_images(html, &[image()]), html);
+    }
+}

@@ -104,6 +104,19 @@ impl Db {
             [],
         );
         let _ = conn.execute("DELETE FROM messages WHERE received = '' AND pending = 0", []);
+        // Bodies cached before pictures were embedded still point at
+        // `cid:` attachments, which render as broken images. Forget them
+        // once; they are fetched again complete on next open.
+        let repaired: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'inline_images'", [], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if repaired.is_none() {
+            let _ = conn.execute("UPDATE messages SET body = NULL WHERE body LIKE '%cid:%'", []);
+            let _ = conn
+                .execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('inline_images', '1')", []);
+        }
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
