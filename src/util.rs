@@ -146,3 +146,28 @@ pub fn wrap_body(is_html: bool, content: &str, dark: bool) -> String {
          </style></head><body>{content}</body></html>"
     )
 }
+
+/// Render a mail thread as one document: every message in order, each under
+/// a small header. A thread of one renders as just its body, so ordinary
+/// mail looks exactly as it did.
+pub fn wrap_thread(
+    messages: &[(String, String, bool, String)],
+    dark: bool,
+) -> String {
+    if let [(_, _, is_html, body)] = messages {
+        return wrap_body(*is_html, body, dark);
+    }
+    let divider = if dark { "#3a3a3a" } else { "#e0e0e0" };
+    let muted = if dark { "#9a9a9a" } else { "#5f5f5f" };
+    let mut content = String::new();
+    for (who, when, is_html, body) in messages {
+        content.push_str(&format!(
+            "<div style='border-top:1px solid {divider};margin-top:14px;padding-top:10px'>\
+             <div style='color:{muted};font-size:0.9em;margin-bottom:6px'>{} · {}</div>{}</div>",
+            escape_html(who),
+            escape_html(when),
+            if *is_html { body.clone() } else { format!("<pre>{}</pre>", escape_html(body)) }
+        ));
+    }
+    wrap_body(true, &content, dark)
+}

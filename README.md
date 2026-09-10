@@ -19,6 +19,9 @@ Graph API and keeps a local copy so mail is readable **offline**.
   pane, its own cache and its own sync, with a shared Favorites section on top
 - Message list grouped by date (Today / Yesterday / weekday / Last Week), an
   All / Unread filter and a date sort toggle
+- **Conversations**: a thread is one row showing how many messages it holds,
+  and opening it reads the whole exchange in order; delete, archive and
+  mark-read act on the conversation. Toggle it off to see single messages
 - Reading pane with contact initials, Reply, Reply all and Forward
 - Drag a message onto a folder to move it (within the same mailbox)
 - **Calendar**: a month view switched from the rail on the left, merging

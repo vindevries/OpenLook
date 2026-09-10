@@ -70,7 +70,7 @@ fn a_partial_delta_entry_only_changes_what_it_carries() {
     assert_eq!(after.from, before.from, "the sender survives");
 
     let folder = db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap();
-    assert_eq!(folder.unread_count, 2, "the badge follows the change");
+    assert_eq!(folder.unread_count, 3, "the badge follows the change");
     cleanup(&path);
 }
 
@@ -98,7 +98,7 @@ fn unread_counts_track_reads() {
     let (db, path) = temp_db("counts");
     let inbox = db.folder_id_by_name("Inbox").unwrap();
     let before = db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap();
-    assert_eq!(before.unread_count, 3, "demo seeds three unread messages");
+    assert_eq!(before.unread_count, 4, "demo seeds four unread messages");
 
     let unread = db
         .messages(&inbox, "")
@@ -222,7 +222,9 @@ fn search_filters_the_cached_folder() {
     let upper = db.messages(&inbox, "ANNA").unwrap();
     let lower = db.messages(&inbox, "anna").unwrap();
     assert_eq!(upper.len(), lower.len(), "search must be case-insensitive");
-    assert_eq!(upper.len(), 2);
+    // Anna sent one, is named in the Jira notification, and is addressed in
+    // the reply that shares the planning thread.
+    assert_eq!(upper.len(), 3);
     assert!(upper.iter().any(|m| m.from.name == "Anna Visser"));
     assert!(upper.iter().any(|m| m.from.name == "Jira" && m.preview.contains("Anna")));
 
@@ -272,5 +274,71 @@ fn a_server_move_renames_the_cached_message() {
     assert!(db.message(&msg.id).unwrap().is_none());
     let moved = db.message("server-side-new-id").unwrap().expect("row follows the new id");
     assert_eq!(moved.summary.subject, msg.subject);
+    cleanup(&path);
+}
+
+#[test]
+fn a_conversation_is_one_row_holding_its_messages() {
+    let (db, path) = temp_db("threads");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let first = db.messages(&inbox, "").unwrap().remove(0);
+    let rows_before = db.conversations(&inbox, "").unwrap();
+    let count_before = rows_before
+        .iter()
+        .find(|c| c.conversation_id == first.conversation_id)
+        .map(|c| c.thread_count)
+        .unwrap_or(0);
+
+    // Two replies land on that thread.
+    let mut reply = first.clone();
+    reply.id = "reply-1".into();
+    reply.subject = format!("RE: {}", first.subject);
+    reply.received = "2030-01-01T10:00:00+00:00".into();
+    reply.is_read = false;
+    let mut later = reply.clone();
+    later.id = "reply-2".into();
+    later.received = "2030-01-02T10:00:00+00:00".into();
+    later.is_read = true;
+    db.upsert_messages(&[reply, later]).unwrap();
+
+    let rows_after = db.conversations(&inbox, "").unwrap();
+    assert_eq!(
+        rows_after.len(),
+        rows_before.len(),
+        "replies join the existing row instead of adding new ones"
+    );
+
+    let row = rows_after
+        .iter()
+        .find(|c| c.conversation_id == first.conversation_id)
+        .expect("the thread still has a row");
+    assert_eq!(row.thread_count, count_before + 2);
+    assert_eq!(row.id, "reply-2", "the row describes the newest message");
+    assert!(!row.is_read, "a thread with any unread message reads as unread");
+
+    let messages = db.conversation_messages(&inbox, &first.conversation_id).unwrap();
+    assert_eq!(messages.len() as i64, count_before + 2);
+    assert!(
+        messages.first().unwrap().summary.received
+            <= messages.last().unwrap().summary.received,
+        "a thread reads oldest first"
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn unrelated_mail_stays_one_row_each() {
+    let (db, path) = temp_db("nothread");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let grouped = db.conversations(&inbox, "").unwrap();
+
+    // The demo seeds exactly one exchange; everything else is its own row.
+    let threads: Vec<_> = grouped.iter().filter(|c| c.thread_count > 1).collect();
+    assert_eq!(threads.len(), 1, "one seeded conversation");
+    assert_eq!(threads[0].thread_count, 2);
+    assert!(
+        grouped.iter().filter(|c| c.thread_count == 1).count() >= 4,
+        "the rest stand alone"
+    );
     cleanup(&path);
 }

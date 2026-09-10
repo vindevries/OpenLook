@@ -26,7 +26,7 @@ const DELTA_PAGE_SIZE: u32 = 100;
 /// then on.
 const DELTA_WINDOW_DAYS: i64 = 30;
 const SUMMARY_FIELDS: &str =
-    "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,parentFolderId";
+    "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,parentFolderId,conversationId";
 
 /// Well-known folders first, in the order Outlook shows them.
 const FOLDER_ORDER: [&str; 7] =
@@ -221,6 +221,38 @@ impl Graph {
             .iter()
             .map(|m| parse_summary(m, folder_id))
             .collect())
+    }
+
+    /// Just the thread each message belongs to, for filling in mail that
+    /// was cached before conversations were tracked. Metadata only, so the
+    /// pages are small.
+    pub async fn conversation_ids(
+        &self,
+        folder_id: &str,
+        max_pages: usize,
+    ) -> GraphResult<Vec<(String, String)>> {
+        let mut url = format!(
+            "{GRAPH}/me/mailFolders/{}/messages?$select=id,conversationId\
+             &$top=500&$orderby=receivedDateTime desc",
+            urlencoding::encode(folder_id)
+        );
+        let mut out = Vec::new();
+        for _ in 0..max_pages {
+            let data = self.get(&url).await?;
+            for item in data["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                let (Some(id), Some(conversation)) =
+                    (item["id"].as_str(), item["conversationId"].as_str())
+                else {
+                    continue;
+                };
+                out.push((id.to_string(), conversation.to_string()));
+            }
+            match data["@odata.nextLink"].as_str() {
+                Some(next) => url = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch changes for a folder. Pass the stored cursor to resume: either
@@ -502,8 +534,15 @@ fn parse_patch(id: String, m: &Value) -> MessagePatch {
 
 fn parse_summary(m: &Value, folder_id: &str) -> MessageSummary {
     let preview = m["bodyPreview"].as_str().unwrap_or_default();
+    let id = m["id"].as_str().unwrap_or_default().to_string();
     MessageSummary {
-        id: m["id"].as_str().unwrap_or_default().to_string(),
+        conversation_id: m["conversationId"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .unwrap_or(&id)
+            .to_string(),
+        thread_count: 1,
+        id: id.clone(),
         folder_id: m["parentFolderId"].as_str().unwrap_or(folder_id).to_string(),
         subject: {
             let s = m["subject"].as_str().unwrap_or_default();

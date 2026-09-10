@@ -211,6 +211,8 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
                 .unwrap_or_default();
             let body = Body { is_html: false, content: message.body.clone() };
             let summary = MessageSummary {
+                conversation_id: local_id.clone(),
+                thread_count: 1,
                 id: local_id.clone(),
                 folder_id: folder,
                 subject: message.subject.clone(),
@@ -420,6 +422,9 @@ impl Engine {
             .map(|t| {
                 let contact = t.contact_ids.first().and_then(|id| names.get(id));
                 MessageSummary {
+                    // A ticket is its own thread.
+                    conversation_id: t.id.clone(),
+                    thread_count: 1,
                     id: t.id.clone(),
                     folder_id: t.stage_id.clone(),
                     subject: t.subject.clone(),
@@ -615,6 +620,7 @@ impl Engine {
                 let _ = self.db.set_delta_link(folder_id, None);
             }
         }
+        self.backfill_conversations(folder_id).await;
         self.prefetch_bodies(folder_id).await;
     }
 
@@ -644,6 +650,26 @@ impl Engine {
         if let Ok(events) = events {
             if self.db.replace_events(start, end, &events).is_ok() {
                 self.emit(Event::CalendarChanged);
+            }
+        }
+    }
+
+    /// Mail cached before threading existed carries no conversation, and
+    /// delta only revisits messages that change — so those rows would never
+    /// group. Sweep the folder once to fill them in.
+    async fn backfill_conversations(&mut self, folder_id: &str) {
+        if self.db.messages_missing_conversation(folder_id) == 0 {
+            return;
+        }
+        let Some(graph) = self.backend.mail() else { return };
+        let pairs = graph.conversation_ids(folder_id, 8).await;
+        self.note_result(&pairs);
+        if let Ok(pairs) = pairs {
+            if let Ok(filled) = self.db.backfill_conversations(&pairs) {
+                if filled > 0 {
+                    eprintln!("openlook: threaded {filled} cached message(s) in one folder");
+                    self.emit(Event::MessagesChanged(folder_id.to_string()));
+                }
             }
         }
     }

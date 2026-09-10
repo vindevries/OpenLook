@@ -119,6 +119,7 @@ pub struct State {
     pending_label: gtk::Label,
     read_toggle: gtk::Button,
     filter_unread: gtk::ToggleButton,
+    thread_toggle: gtk::ToggleButton,
     sort_button: gtk::Button,
     folder_title: gtk::Label,
     count_label: gtk::Label,
@@ -142,6 +143,10 @@ pub struct State {
     collapsed: RefCell<HashSet<String>>,
     current: RefCell<Option<(usize, String)>>,
     current_message: RefCell<Option<String>>,
+    /// Ids of the messages in the conversation on show, so a body arriving
+    /// for any of them refreshes the pane.
+    current_thread: RefCell<Vec<String>>,
+    threaded: Cell<bool>,
     scope: Cell<Scope>,
     /// Selection is remembered per scope, so switching panes returns you
     /// to where you were.
@@ -349,6 +354,13 @@ pub fn build(app: &adw::Application) {
     filter_unread.set_group(Some(&filter_all));
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
+    let thread_toggle = gtk::ToggleButton::builder()
+        .label("Conversations")
+        .tooltip_text("Group messages by conversation")
+        .active(crate::config::Settings::load().threaded())
+        .build();
+    thread_toggle.add_css_class("flat");
+    thread_toggle.add_css_class("filter-tab");
     let sort_button = gtk::Button::builder().tooltip_text("Sort by date").build();
     sort_button.add_css_class("flat");
     sort_button.set_child(Some(
@@ -357,6 +369,7 @@ pub fn build(app: &adw::Application) {
     filter_row.append(&filter_all);
     filter_row.append(&filter_unread);
     filter_row.append(&spacer);
+    filter_row.append(&thread_toggle);
     filter_row.append(&sort_button);
     list_head.append(&filter_row);
     list_pane.append(&list_head);
@@ -608,6 +621,7 @@ pub fn build(app: &adw::Application) {
         pending_label,
         read_toggle,
         filter_unread,
+        thread_toggle,
         sort_button,
         folder_title,
         count_label,
@@ -628,6 +642,8 @@ pub fn build(app: &adw::Application) {
         collapsed: RefCell::new(HashSet::new()),
         current: RefCell::new(None),
         current_message: RefCell::new(None),
+        current_thread: RefCell::new(Vec::new()),
+        threaded: Cell::new(crate::config::Settings::load().threaded()),
         scope: Cell::new(Scope::Mail),
         mail_selection: RefCell::new(None),
         ticket_selection: RefCell::new(None),
@@ -780,6 +796,18 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         reload_messages(&s);
     });
 
+    {
+        let s = state.clone();
+        state.thread_toggle.connect_toggled(move |button| {
+            s.threaded.set(button.is_active());
+            let mut settings = crate::config::Settings::load();
+            settings.thread_view = Some(button.is_active());
+            let _ = settings.save();
+            show_message(&s, None);
+            reload_messages(&s);
+        });
+    }
+
     let s = state.clone();
     state.sort_button.connect_clicked(move |button| {
         let newest = !s.newest_first.get();
@@ -912,7 +940,23 @@ pub fn listen(state: &Rc<State>, index: usize) {
                     reload_folders(&state, false);
                 }
                 Event::BodyReady(id) => {
-                    if state.current_message.borrow().as_deref() == Some(id.as_str()) {
+                    let in_thread = state.current_thread.borrow().iter().any(|m| m == &id);
+                    if in_thread && state.current_thread.borrow().len() > 1 {
+                        // Re-render the conversation with whatever has arrived.
+                        let session = state.active_session();
+                        let db = state.sessions.borrow().get(session).map(|s| s.db.clone());
+                        let current = state.current.borrow().clone();
+                        if let (Some(db), Some((_, folder))) = (db, current) {
+                            if let Ok(Some(detail)) = db.message(&id) {
+                                let thread = db
+                                    .conversation_messages(&folder, &detail.summary.conversation_id)
+                                    .unwrap_or_default();
+                                if thread.len() > 1 {
+                                    render_thread(&state, &thread);
+                                }
+                            }
+                        }
+                    } else if state.current_message.borrow().as_deref() == Some(id.as_str()) {
                         let db = state.sessions.borrow().get(index).map(|s| s.db.clone());
                         if let Some(Ok(Some(detail))) = db.map(|db| db.message(&id)) {
                             render_body(&state, &detail);
@@ -1224,7 +1268,12 @@ pub fn reload_messages(state: &Rc<State>) {
     };
     let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
     let query = state.search.text().to_string();
-    let Ok(mut messages) = db.messages(&folder_id, &query) else { return };
+    let listing = if state.threaded.get() {
+        db.conversations(&folder_id, &query)
+    } else {
+        db.messages(&folder_id, &query)
+    };
+    let Ok(mut messages) = listing else { return };
     if state.unread_only.get() {
         messages.retain(|m| !m.is_read);
     }
@@ -1345,6 +1394,12 @@ fn message_row(message: &MessageSummary, session: usize) -> gtk::ListBoxRow {
         chip.add_css_class("queued-chip");
         line.append(&chip);
     }
+    if message.thread_count > 1 {
+        let count = gtk::Label::new(Some(&message.thread_count.to_string()));
+        count.add_css_class("count-muted");
+        count.set_tooltip_text(Some("Messages in this conversation"));
+        line.append(&count);
+    }
     if message.has_attachments {
         line.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
     }
@@ -1377,7 +1432,29 @@ fn message_row(message: &MessageSummary, session: usize) -> gtk::ListBoxRow {
 fn open_message(state: &Rc<State>, summary: &MessageSummary) {
     let session_index = state.active_session();
     let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
+
+    // A conversation shows every message it holds; a single mail behaves
+    // exactly as before.
+    let thread = if summary.thread_count > 1 {
+        db.conversation_messages(&summary.folder_id, &summary.conversation_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if thread.len() > 1 {
+        *state.current_thread.borrow_mut() = thread.iter().map(|m| m.summary.id.clone()).collect();
+        show_conversation(state, &thread);
+        // Fill in any bodies not cached yet.
+        for message in thread.iter().filter(|m| m.body.is_none()) {
+            if let Some(session) = state.sessions.borrow().get(session_index) {
+                session.send(Cmd::OpenMessage(message.summary.id.clone()));
+            }
+        }
+        mark_thread_read(state, &thread);
+        return;
+    }
+
     let Ok(Some(detail)) = db.message(&summary.id) else { return };
+    *state.current_thread.borrow_mut() = vec![summary.id.clone()];
     show_message(state, Some(&detail));
 
     if detail.body.is_none() {
@@ -1397,9 +1474,44 @@ fn open_message(state: &Rc<State>, summary: &MessageSummary) {
     }
 }
 
+/// Opening a conversation marks everything unread in it as read, the way
+/// Outlook treats a conversation as one item.
+fn mark_thread_read(state: &Rc<State>, thread: &[MessageDetail]) {
+    let session_index = state.active_session();
+    let unread: Vec<String> = thread
+        .iter()
+        .filter(|m| !m.summary.is_read)
+        .map(|m| m.summary.id.clone())
+        .collect();
+    if unread.is_empty() {
+        return;
+    }
+    for id in unread {
+        let op = Op::MarkRead { message_id: id, is_read: true };
+        let _ = state.sessions.borrow().get(session_index).map(|s| s.apply(op));
+    }
+    reload_messages(state);
+    reload_folders(state, false);
+    update_read_toggle(state, true);
+}
+
+/// Show a whole thread: the newest message heads the pane, and the bodies
+/// run underneath it in order.
+fn show_conversation(state: &Rc<State>, thread: &[MessageDetail]) {
+    let Some(latest) = thread.last() else { return };
+    show_message(state, Some(latest));
+    state.subject_label.set_text(&format!(
+        "{}  ({} messages)",
+        latest.summary.subject,
+        thread.len()
+    ));
+    render_thread(state, thread);
+}
+
 fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     let Some(detail) = detail else {
         *state.current_message.borrow_mut() = None;
+        state.current_thread.borrow_mut().clear();
         state.reading.set_visible_child_name("empty");
         return;
     };
@@ -1443,6 +1555,39 @@ fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     update_read_toggle(state, detail.summary.is_read);
     render_body(state, detail);
     state.reading.set_visible_child_name("message");
+}
+
+fn render_thread(state: &Rc<State>, thread: &[MessageDetail]) {
+    let dark = adw::StyleManager::default().is_dark();
+    let parts: Vec<(String, String, bool, String)> = thread
+        .iter()
+        .map(|m| {
+            let (is_html, body) = match &m.body {
+                Some(body) => (body.is_html, body.content.clone()),
+                None => (true, "<p style='color:#888'>Downloading…</p>".to_string()),
+            };
+            (
+                m.summary.from.display().to_string(),
+                fmt_full_time(&m.summary.received),
+                is_html,
+                body,
+            )
+        })
+        .collect();
+    #[cfg(feature = "html-view")]
+    state.webview.load_html(&crate::util::wrap_thread(&parts, dark), None);
+    #[cfg(not(feature = "html-view"))]
+    {
+        let _ = dark;
+        let text: Vec<String> = parts
+            .iter()
+            .map(|(who, when, is_html, body)| {
+                let body = if *is_html { crate::util::html_to_text(body) } else { body.clone() };
+                format!("{who} · {when}\n{body}")
+            })
+            .collect();
+        state.body_label.set_text(&text.join("\n\n"));
+    }
 }
 
 fn render_body(state: &Rc<State>, detail: &MessageDetail) {
@@ -1513,6 +1658,16 @@ pub fn toast(state: &Rc<State>, message: &str) {
 }
 
 // -- actions ------------------------------------------------------------
+
+/// Every message the selection stands for: a whole conversation when the
+/// list is grouped, otherwise the one message.
+fn selected_message_ids(state: &Rc<State>) -> Vec<String> {
+    let thread = state.current_thread.borrow().clone();
+    if !thread.is_empty() {
+        return thread;
+    }
+    state.current_message.borrow().clone().into_iter().collect()
+}
 
 fn current_detail(state: &Rc<State>) -> Option<MessageDetail> {
     let id = state.current_message.borrow().clone()?;
@@ -1613,10 +1768,11 @@ fn archive_current(state: &Rc<State>) {
 fn toggle_read_current(state: &Rc<State>) {
     let Some(detail) = current_detail(state) else { return };
     let target = !detail.summary.is_read;
-    if let Err(e) = apply_op(state, Op::MarkRead { message_id: detail.summary.id, is_read: target })
-    {
-        toast(state, &e.to_string());
-        return;
+    for id in selected_message_ids(state) {
+        if let Err(e) = apply_op(state, Op::MarkRead { message_id: id, is_read: target }) {
+            toast(state, &e.to_string());
+            return;
+        }
     }
     update_read_toggle(state, target);
     reload_messages(state);

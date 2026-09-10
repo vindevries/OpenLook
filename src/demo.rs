@@ -68,6 +68,22 @@ pub fn seed(db: &Db) -> Result<()> {
             unread: true,
             to: &[OWNER],
         },
+        // Shares a thread with the message above, so the demo shows how a
+        // conversation reads.
+        Seed {
+            folder: "inbox",
+            from: ("Mark de Jong", "mark@fabrikam.nl"),
+            subject: "RE: Q3 planning review — agenda",
+            paragraphs: &[
+                "Anna, Vincent,",
+                "Capacity numbers from my side are ready. One caveat: the migration \
+                 window in week 40 overlaps with the release freeze.",
+                "Mark",
+            ],
+            age_hours: 1,
+            unread: true,
+            to: &[OWNER],
+        },
         Seed {
             folder: "inbox",
             from: ("GitLab", "noreply@gitlab.com"),
@@ -209,6 +225,8 @@ pub fn seed(db: &Db) -> Result<()> {
     for (index, seed) in seeds.iter().enumerate() {
         let body_html = html(seed.paragraphs);
         let summary = MessageSummary {
+            conversation_id: format!("demo-thread-{}", seed.subject.trim_start_matches("RE: ")),
+            thread_count: 1,
             id: format!("demo-{index}"),
             folder_id: seed.folder.to_string(),
             subject: seed.subject.to_string(),

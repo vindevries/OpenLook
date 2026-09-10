@@ -52,6 +52,12 @@ pub enum Pending {
 pub struct MessageSummary {
     pub id: String,
     pub folder_id: String,
+    /// Thread this message belongs to. Graph calls it conversationId;
+    /// falls back to the message's own id when the server gave none.
+    pub conversation_id: String,
+    /// How many messages the row stands for. One unless the list is
+    /// showing conversations.
+    pub thread_count: i64,
     pub subject: String,
     pub from: Address,
     /// RFC3339 in UTC, so plain string ordering is chronological.

@@ -88,6 +88,12 @@ impl Db {
         ] {
             let _ = conn.execute(statement, []);
         }
+        // Adding the conversation column succeeds exactly once. Cached mail
+        // predates it, so drop the delta cursors at the same moment and let
+        // the next sync refill the rows with their thread.
+        if conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT", []).is_ok() {
+            let _ = conn.execute("UPDATE folders SET delta_link = NULL", []);
+        }
         // Partial delta entries used to be stored as whole messages, which
         // left rows behind with no date, sender or subject. Drop them and
         // let the folders that held them enumerate again, which refetches
@@ -215,7 +221,8 @@ impl Db {
         let search = search.trim();
         let like = format!("%{search}%");
         let sql = "SELECT id, folder_id, subject, from_name, from_addr, received, preview,
-                          is_read, has_attachments, pending
+                          is_read, has_attachments, pending,
+                          COALESCE(NULLIF(conversation_id, ''), id)
                      FROM messages WHERE folder_id = ?1"
             .to_string();
         let sql = if search.is_empty() {
@@ -239,6 +246,8 @@ impl Db {
                 is_read: r.get::<_, i64>(7)? != 0,
                 has_attachments: r.get::<_, i64>(8)? != 0,
                 pending: if r.get::<_, i64>(9)? != 0 { Pending::Queued } else { Pending::None },
+                conversation_id: r.get(10)?,
+                thread_count: 1,
             })
         };
         let rows = if search.is_empty() {
@@ -249,12 +258,90 @@ impl Db {
         Ok(rows)
     }
 
+    /// One row per conversation: the newest message of each thread, how
+    /// many messages it stands for, and whether any of them are unread.
+    ///
+    /// SQLite fills the bare columns from the row that produced MAX(received),
+    /// so the row describes the latest message of its thread.
+    pub fn conversations(&self, folder_id: &str, search: &str) -> Result<Vec<MessageSummary>> {
+        let conn = self.conn();
+        let search = search.trim();
+        let like = format!("%{search}%");
+        let filter = if search.is_empty() {
+            String::new()
+        } else {
+            " AND (subject LIKE ?2 COLLATE NOCASE
+                OR from_name LIKE ?2 COLLATE NOCASE
+                OR from_addr LIKE ?2 COLLATE NOCASE
+                OR preview LIKE ?2 COLLATE NOCASE)"
+                .to_string()
+        };
+        let sql = format!(
+            "SELECT id, folder_id, subject, from_name, from_addr, MAX(received), preview,
+                    MIN(is_read), MAX(has_attachments), MAX(pending),
+                    COALESCE(NULLIF(conversation_id, ''), id) AS cid, COUNT(*)
+               FROM messages WHERE folder_id = ?1{filter}
+              GROUP BY cid
+              ORDER BY MAX(received) DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<MessageSummary> {
+            Ok(MessageSummary {
+                id: r.get(0)?,
+                folder_id: r.get(1)?,
+                subject: r.get(2)?,
+                from: Address { name: r.get(3)?, address: r.get(4)? },
+                received: r.get(5)?,
+                preview: r.get(6)?,
+                is_read: r.get::<_, i64>(7)? != 0,
+                has_attachments: r.get::<_, i64>(8)? != 0,
+                pending: if r.get::<_, i64>(9)? != 0 { Pending::Queued } else { Pending::None },
+                conversation_id: r.get(10)?,
+                thread_count: r.get(11)?,
+            })
+        };
+        let rows = if search.is_empty() {
+            stmt.query_map(params![folder_id], map)?.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![folder_id, like], map)?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Every message of one thread in a folder, oldest first.
+    pub fn conversation_messages(
+        &self,
+        folder_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<MessageDetail>> {
+        let ids: Vec<String> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages
+                  WHERE folder_id = ?1 AND COALESCE(NULLIF(conversation_id, ''), id) = ?2
+                  ORDER BY received",
+            )?;
+            let rows = stmt
+                .query_map(params![folder_id, conversation_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(detail) = self.message(&id)? {
+                out.push(detail);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn message(&self, id: &str) -> Result<Option<MessageDetail>> {
         let conn = self.conn();
         let detail = conn
             .query_row(
                 "SELECT id, folder_id, subject, from_name, from_addr, received, preview,
-                        is_read, has_attachments, pending, to_json, cc_json, body_is_html, body
+                        is_read, has_attachments, pending, to_json, cc_json, body_is_html, body,
+                        COALESCE(NULLIF(conversation_id, ''), id)
                    FROM messages WHERE id = ?1",
                 params![id],
                 |r| {
@@ -277,6 +364,8 @@ impl Db {
                             } else {
                                 Pending::None
                             },
+                            conversation_id: r.get(14)?,
+                            thread_count: 1,
                         },
                         to: to_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
                         cc: cc_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
@@ -304,9 +393,10 @@ impl Db {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages
                      (id, folder_id, subject, from_name, from_addr, received, preview,
-                      is_read, has_attachments)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                      is_read, has_attachments, conversation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(id) DO UPDATE SET
+                     conversation_id = excluded.conversation_id,
                      folder_id       = excluded.folder_id,
                      subject         = excluded.subject,
                      from_name       = excluded.from_name,
@@ -330,6 +420,7 @@ impl Db {
                     m.preview,
                     m.is_read as i64,
                     m.has_attachments as i64,
+                    m.conversation_id,
                 ])?;
             }
         }
@@ -425,6 +516,37 @@ impl Db {
         Ok(())
     }
 
+    /// Cached mail with no thread recorded yet.
+    pub fn messages_missing_conversation(&self, folder_id: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                  WHERE folder_id = ?1 AND (conversation_id IS NULL OR conversation_id = '')",
+                params![folder_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Fill in threads for messages already cached, leaving everything else
+    /// untouched.
+    pub fn backfill_conversations(&self, pairs: &[(String, String)]) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut filled = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET conversation_id = ?2
+                  WHERE id = ?1 AND (conversation_id IS NULL OR conversation_id = '')",
+            )?;
+            for (id, conversation) in pairs {
+                filled += stmt.execute(params![id, conversation])?;
+            }
+        }
+        tx.commit()?;
+        Ok(filled)
+    }
+
     pub fn set_body(&self, id: &str, body: &Body, to: &[Address], cc: &[Address]) -> Result<()> {
         self.conn().execute(
             "UPDATE messages SET body = ?2, body_is_html = ?3, to_json = ?4, cc_json = ?5
@@ -510,8 +632,9 @@ impl Db {
         self.conn().execute(
             "INSERT OR REPLACE INTO messages
                  (id, folder_id, subject, from_name, from_addr, received, preview,
-                  is_read, has_attachments, to_json, cc_json, body_is_html, body, pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  is_read, has_attachments, to_json, cc_json, body_is_html, body, pending,
+                  conversation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 summary.id,
                 summary.folder_id,
@@ -527,6 +650,7 @@ impl Db {
                 body.is_html as i64,
                 body.content,
                 matches!(summary.pending, Pending::Queued) as i64,
+                summary.conversation_id,
             ],
         )?;
         Ok(())
