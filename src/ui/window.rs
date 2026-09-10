@@ -1788,6 +1788,40 @@ fn current_detail(state: &Rc<State>) -> Option<MessageDetail> {
     db.message(&id).ok().flatten()
 }
 
+/// The row the list should land on once the message at `position` leaves
+/// it: the row that closes the gap, or the one above when it was last.
+/// Date headers are not messages, so they are skipped over.
+fn next_selection(entries: &[ListEntry], position: usize) -> Option<usize> {
+    let is_message =
+        |entry: &ListEntry| matches!(entry, ListEntry::Message(_) | ListEntry::Conversation(_));
+    let position = position.min(entries.len());
+    entries[position..]
+        .iter()
+        .position(is_message)
+        .map(|offset| position + offset)
+        .or_else(|| entries[..position].iter().rposition(is_message))
+}
+
+/// Where the selected row sits. The widget's own selection is the truth
+/// here rather than the message id: archiving moves the message on the
+/// server, which renames it, so the id is gone by the time the list is
+/// rebuilt.
+fn selected_position(state: &Rc<State>) -> Option<usize> {
+    state.message_list.selected_row().map(|row| row.index() as usize)
+}
+
+/// Select the row that took the place of the one that left, as if the
+/// user had clicked it, so the reading pane opens it.
+fn select_after_removal(state: &Rc<State>, position: usize) {
+    let index = {
+        let entries = state.entries.borrow();
+        next_selection(&entries, position)
+    };
+    if let Some(row) = index.and_then(|i| state.message_list.row_at_index(i as i32)) {
+        state.message_list.select_row(Some(&row));
+    }
+}
+
 fn respond(state: &Rc<State>, mode: SendMode) {
     if let Some(detail) = current_detail(state) {
         ComposeWindow::open(state, state.active_session(), Some((detail, mode)));
@@ -1839,16 +1873,27 @@ fn delete_current(state: &Rc<State>) {
         (Some(bin), detail) => detail.summary.folder_id == bin,
         (None, _) => true,
     };
-    match apply_op(state, Op::Delete { message_id: detail.summary.id.clone(), purge }) {
+    let position = selected_position(state);
+    let removed = match apply_op(state, Op::Delete { message_id: detail.summary.id.clone(), purge })
+    {
         Ok(()) => {
             show_message(state, None);
             toast(state, if purge { "Deleted" } else { "Moved to Deleted Items" });
+            true
         }
-        Err(e) => toast(state, &e.to_string()),
-    }
+        Err(e) => {
+            toast(state, &e.to_string());
+            false
+        }
+    };
     reload_messages(state);
     reload_folders(state, false);
     render_status(state);
+    if removed {
+        if let Some(position) = position {
+            select_after_removal(state, position);
+        }
+    }
 }
 
 fn archive_current(state: &Rc<State>) {
@@ -1866,16 +1911,29 @@ fn archive_current(state: &Rc<State>) {
     }
     // Queued like any other change, so it reaches the server and survives
     // being made offline.
-    match apply_op(state, Op::Move { message_id: detail.summary.id.clone(), folder_id: archive }) {
+    let position = selected_position(state);
+    let moved = match apply_op(
+        state,
+        Op::Move { message_id: detail.summary.id.clone(), folder_id: archive },
+    ) {
         Ok(()) => {
             show_message(state, None);
             toast(state, "Moved to Archive");
+            true
         }
-        Err(e) => toast(state, &e.to_string()),
-    }
+        Err(e) => {
+            toast(state, &e.to_string());
+            false
+        }
+    };
     reload_messages(state);
     reload_folders(state, false);
     render_status(state);
+    if moved {
+        if let Some(position) = position {
+            select_after_removal(state, position);
+        }
+    }
 }
 
 fn toggle_read_current(state: &Rc<State>) {
@@ -2012,4 +2070,55 @@ pub fn remove_active_account(state: &Rc<State>) -> Option<String> {
 /// Runtime handle for dialogs that need to run async work.
 pub fn rt() -> &'static tokio::runtime::Runtime {
     runtime()
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::model::{Address, Pending};
+
+    fn message(id: &str) -> ListEntry {
+        ListEntry::Message(MessageSummary {
+            id: id.into(),
+            folder_id: "inbox".into(),
+            conversation_id: id.into(),
+            thread_count: 1,
+            subject: "Subject".into(),
+            from: Address { name: String::new(), address: "someone@example.com".into() },
+            received: "2026-09-10T10:00:00Z".into(),
+            preview: String::new(),
+            is_read: true,
+            has_attachments: false,
+            pending: Pending::None,
+        })
+    }
+
+    /// Archiving closes the gap: the row below moves up into the place the
+    /// message left, and that is the one to open.
+    #[test]
+    fn the_next_message_takes_the_place_of_the_one_removed() {
+        let after = vec![ListEntry::DateHeader, message("b"), message("c")];
+        assert_eq!(next_selection(&after, 1), Some(1));
+    }
+
+    /// A date header is not a message, so a selection landing on one keeps
+    /// looking downwards.
+    #[test]
+    fn a_date_header_is_stepped_over() {
+        let after = vec![ListEntry::DateHeader, message("a"), ListEntry::DateHeader, message("b")];
+        assert_eq!(next_selection(&after, 2), Some(3));
+    }
+
+    /// Archiving the last message in a folder falls back to the one above.
+    #[test]
+    fn the_last_message_falls_back_upwards() {
+        let after = vec![ListEntry::DateHeader, message("a")];
+        assert_eq!(next_selection(&after, 2), Some(1));
+    }
+
+    /// Emptying the folder leaves nothing to select.
+    #[test]
+    fn an_empty_folder_selects_nothing() {
+        assert_eq!(next_selection(&[ListEntry::DateHeader], 1), None);
+    }
 }
