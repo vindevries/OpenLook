@@ -558,7 +558,7 @@ impl Graph {
     /// Ask the server for a draft reply or forward. It comes back holding
     /// the original message — and, for a forward, its attachments — which
     /// is what carries them through to the recipient.
-    async fn response_draft(&self, original: &str, mode: SendMode) -> GraphResult<String> {
+    async fn response_draft(&self, original: &str, mode: SendMode) -> GraphResult<(String, String)> {
         let action = match mode {
             SendMode::Reply => "createReply",
             SendMode::ReplyAll => "createReplyAll",
@@ -570,23 +570,27 @@ impl Graph {
             .send(self.http.post(url).json(&json!({})))
             .await?
             .ok_or_else(|| GraphError::Transient("Empty response".into()))?;
-        draft["id"]
+        let id = draft["id"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| GraphError::Permanent("The server returned no draft to send".into()))
+            .ok_or_else(|| GraphError::Permanent("The server returned no draft to send".into()))?;
+        // The draft already holds the original message, formatting intact.
+        Ok((id, draft["body"]["content"].as_str().unwrap_or_default().to_string()))
     }
 
     pub async fn send_mail(&self, msg: &Outgoing) -> GraphResult<()> {
         if let Some(original) = &msg.in_reply_to {
             if !matches!(msg.mode, SendMode::New) {
-                // The composer already shows the original quoted beneath
-                // what was typed, so the whole body goes out as written —
-                // asking the server to quote it again would repeat it.
-                let draft = self.response_draft(original, msg.mode).await?;
+                // The server's draft carries the original as it was
+                // written — and, for a forward, its attachments. Keep that
+                // body and put what was typed above it, rather than handing
+                // the server a comment to quote its own way.
+                let (draft, quoted) = self.response_draft(original, msg.mode).await?;
                 let id = urlencoding::encode(&draft);
                 let url = format!("{GRAPH}/me/messages/{id}");
+                let body = crate::util::prepend_comment(&quoted, &crate::util::text_as_html(&msg.body));
                 self.send(self.http.patch(url).json(&json!({
-                    "body": { "contentType": "HTML", "content": crate::util::text_as_html(&msg.body) },
+                    "body": { "contentType": "HTML", "content": body },
                     "toRecipients": addresses(&msg.to),
                     "ccRecipients": addresses(&msg.cc),
                 })))

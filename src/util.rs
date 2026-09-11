@@ -209,6 +209,26 @@ pub fn cid_references(html: &str) -> std::collections::HashSet<String> {
 ///
 /// Content ids appear in mail both bare and wrapped in angle brackets, and
 /// the reference in the HTML may be either form, so both are matched.
+/// Put what was typed above the message being answered or forwarded,
+/// leaving that message's own markup untouched so it reaches the
+/// recipient looking as it did — pictures, tables and all. The original
+/// is a whole HTML document, so the text goes just inside its body
+/// rather than being pasted in front of it.
+pub fn prepend_comment(original: &str, comment: &str) -> String {
+    let lower = original.to_lowercase();
+    if let Some(start) = lower.find("<body") {
+        if let Some(end) = original[start..].find('>') {
+            let at = start + end + 1;
+            let mut out = String::with_capacity(original.len() + comment.len());
+            out.push_str(&original[..at]);
+            out.push_str(comment);
+            out.push_str(&original[at..]);
+            return out;
+        }
+    }
+    format!("{comment}{original}")
+}
+
 /// The original message, quoted the way Outlook quotes it in a reply or
 /// a forward, so what is on screen is what the recipient will read.
 pub fn quoted_original(
@@ -363,6 +383,26 @@ mod cid_tests {
 #[cfg(test)]
 mod quote_tests {
     use super::*;
+
+    /// A forward must reach the recipient looking as the original did,
+    /// so the original's own markup is left alone and what was typed goes
+    /// inside its body rather than in front of the document.
+    #[test]
+    fn typed_text_goes_inside_the_original_document() {
+        let original = "<html><head><style>p{color:red}</style></head>\
+                        <body dir=\"ltr\"><p>Invoice attached</p></body></html>";
+        let sent = prepend_comment(original, "<div>Please handle this</div>");
+        assert!(sent.starts_with("<html><head>"), "the original's head survives");
+        assert!(sent.contains("<body dir=\"ltr\"><div>Please handle this</div><p>"));
+        assert!(sent.contains("<p>Invoice attached</p>"), "the original is untouched");
+    }
+
+    /// A fragment with no body tag still gets the text above it.
+    #[test]
+    fn a_bare_fragment_takes_the_text_in_front() {
+        let sent = prepend_comment("<p>Hello</p>", "<div>Note</div>");
+        assert_eq!(sent, "<div>Note</div><p>Hello</p>");
+    }
 
     #[test]
     fn a_forward_carries_the_original_and_says_who_sent_it() {

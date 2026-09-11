@@ -4,25 +4,48 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+#[cfg(feature = "html-view")]
+use webkit::prelude::*;
 
 use crate::model::{MessageDetail, Op, Outgoing, SendMode};
-use crate::util::{fmt_full_time, quoted_original};
 use crate::ui::widgets::{EntryRow, ToolbarView};
 use crate::ui::window::{self, State};
 
 pub struct ComposeWindow;
 
 impl ComposeWindow {
-    /// `respond_to` carries the message being answered and how.
-    fn quote_source(detail: &MessageDetail) -> String {
-        match &detail.body {
-            Some(body) if body.is_html => crate::util::html_to_text(&body.content),
-            Some(body) => body.content.clone(),
-            // Not downloaded — the preview is all the cache holds.
-            None => detail.summary.preview.clone(),
+    /// The message being answered or forwarded, rendered as it reads.
+    fn original_view(detail: &MessageDetail) -> gtk::Widget {
+        let (is_html, content) = match &detail.body {
+            Some(body) => (body.is_html, body.content.clone()),
+            None => (false, detail.summary.preview.clone()),
+        };
+        #[cfg(feature = "html-view")]
+        {
+            let view = webkit::WebView::new();
+            view.set_vexpand(true);
+            if let Some(settings) = webkit::prelude::WebViewExt::settings(&view) {
+                // Mail is untrusted content, the same as in the reading pane.
+                settings.set_enable_javascript(false);
+                settings.set_enable_html5_local_storage(false);
+                settings.set_enable_developer_extras(false);
+            }
+            let dark = adw::StyleManager::default().is_dark();
+            view.load_html(&crate::util::wrap_body(is_html, &content, dark), None);
+            gtk::Frame::builder().child(&view).build().upcast()
+        }
+        #[cfg(not(feature = "html-view"))]
+        {
+            let text =
+                if is_html { crate::util::html_to_text(&content) } else { content.clone() };
+            let label = gtk::Label::builder().xalign(0.0).yalign(0.0).wrap(true).label(text).build();
+            let scroll =
+                gtk::ScrolledWindow::builder().child(&label).vexpand(true).build();
+            gtk::Frame::builder().child(&scroll).build().upcast()
         }
     }
 
+    /// `respond_to` carries the message being answered and how.
     pub fn open(
         state: &Rc<State>,
         session_index: usize,
@@ -112,35 +135,43 @@ impl ComposeWindow {
             .left_margin(8)
             .right_margin(8)
             .build();
-        // Quote what is being answered or passed on, the way Outlook does,
-        // so it can be read and trimmed before it goes out.
-        if let Some(original) = &original {
-            if !matches!(mode, SendMode::New) {
-                let names = |list: &[crate::model::Address]| {
-                    list.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", ")
-                };
-                let text = quoted_original(
-                    matches!(mode, SendMode::Forward),
-                    &format!(
-                        "{} <{}>",
-                        original.summary.from.display(),
-                        original.summary.from.address
-                    ),
-                    &fmt_full_time(&original.summary.received),
-                    &names(&original.to),
-                    &names(&original.cc),
-                    &original.summary.subject,
-                    &Self::quote_source(original),
-                );
-                let buffer = body_view.buffer();
-                buffer.set_text(&text);
-                // Start where the reply gets typed, above the quote.
-                buffer.place_cursor(&buffer.start_iter());
+        let body_scroll = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
+        let editor = gtk::Frame::builder().child(&body_scroll).build();
+
+        match &original {
+            // A reply or forward carries the message below whatever is
+            // typed. It goes out with its own formatting, so show it that
+            // way rather than as a flattened copy that would mislead.
+            Some(original) if !matches!(mode, SendMode::New) => {
+                let below = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                let caption = gtk::Label::builder()
+                    .xalign(0.0)
+                    .label(if matches!(mode, SendMode::Forward) {
+                        "Forwarded below, with its formatting and attachments"
+                    } else {
+                        "Quoted below"
+                    })
+                    .build();
+                caption.add_css_class("dim-label");
+                caption.add_css_class("caption");
+                below.append(&caption);
+                below.append(&Self::original_view(original));
+                let split = gtk::Paned::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .vexpand(true)
+                    .position(200)
+                    .resize_start_child(true)
+                    .resize_end_child(true)
+                    .build();
+                split.set_start_child(Some(&editor));
+                split.set_end_child(Some(&below));
+                content.append(&split);
+            }
+            _ => {
+                editor.set_vexpand(true);
+                content.append(&editor);
             }
         }
-
-        let body_scroll = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
-        content.append(&gtk::Frame::builder().child(&body_scroll).build());
 
         let error_label = gtk::Label::builder().xalign(0.0).wrap(true).visible(false).build();
         error_label.add_css_class("error");
