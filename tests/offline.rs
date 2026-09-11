@@ -147,6 +147,7 @@ fn changes_made_offline_are_queued_and_survive_restart() {
     let send = Op::Send {
         local_id: "local:test".into(),
         message: Outgoing {
+            is_html: false,
             to: vec!["someone@example.com".into()],
             cc: vec![],
             subject: "Written on a train".into(),

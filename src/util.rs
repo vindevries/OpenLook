@@ -213,65 +213,145 @@ pub fn cid_references(html: &str) -> std::collections::HashSet<String> {
 /// leaving that message's own markup untouched so it reaches the
 /// recipient looking as it did — pictures, tables and all. The original
 /// is a whole HTML document, so the text goes just inside its body
-/// rather than being pasted in front of it.
-pub fn prepend_comment(original: &str, comment: &str) -> String {
-    let lower = original.to_lowercase();
-    if let Some(start) = lower.find("<body") {
-        if let Some(end) = original[start..].find('>') {
-            let at = start + end + 1;
-            let mut out = String::with_capacity(original.len() + comment.len());
-            out.push_str(&original[..at]);
-            out.push_str(comment);
-            out.push_str(&original[at..]);
-            return out;
-        }
+
+/// The date the way Outlook writes it in a quoted header:
+/// "Monday, October 1, 2007 3:17 PM".
+pub fn fmt_outlook_time(iso: &str) -> String {
+    match DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => t.with_timezone(&Local).format("%A, %B %-d, %Y %-I:%M %p").to_string(),
+        Err(_) => iso.to_string(),
     }
-    format!("{comment}{original}")
 }
 
-/// The original message, quoted the way Outlook quotes it in a reply or
-/// a forward, so what is on screen is what the recipient will read.
-pub fn quoted_original(
-    forwarded: bool,
+/// The header Outlook puts above a quoted message. It goes into the body
+/// being edited, so it is HTML — plain, so it reads the same everywhere.
+pub fn original_message_block(
     from: &str,
     sent: &str,
     to: &str,
     cc: &str,
     subject: &str,
-    body: &str,
 ) -> String {
-    let mut out = String::new();
-    out.push_str(if forwarded {
-        "\n\n---------- Forwarded message ----------\n"
-    } else {
-        "\n\n________________________________\n"
-    });
-    out.push_str(&format!("From: {from}\n"));
+    let mut lines = format!("From: {}", escape_html(from));
     if !sent.is_empty() {
-        out.push_str(&format!("Sent: {sent}\n"));
+        lines.push_str(&format!("<br>Sent: {}", escape_html(sent)));
     }
     if !to.is_empty() {
-        out.push_str(&format!("To: {to}\n"));
+        lines.push_str(&format!("<br>To: {}", escape_html(to)));
     }
     if !cc.is_empty() {
-        out.push_str(&format!("Cc: {cc}\n"));
+        lines.push_str(&format!("<br>Cc: {}", escape_html(cc)));
     }
-    out.push_str(&format!("Subject: {subject}\n\n"));
-    out.push_str(body.trim_end());
-    out.push('\n');
+    lines.push_str(&format!("<br>Subject: {}", escape_html(subject)));
+    format!(
+        "<div style=\"font-family:'Segoe UI',Ubuntu,sans-serif;font-size:11pt\">\
+         <b>-----Original Message-----</b><br>{lines}</div><div><br></div>"
+    )
+}
+
+/// Mail being edited is still mail: untrusted. The composer has to run
+/// scripting to read back what was written, so anything that could run on
+/// its own is taken out of the message first.
+pub fn sanitize_for_editor(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    // Drop <script>/<style-with-script> elements whole, contents and all.
+    loop {
+        let lower = rest.to_lowercase();
+        let Some(open) = lower.find("<script") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        rest = match lower[open..].find("</script>") {
+            Some(close) => &rest[open + close + "</script>".len()..],
+            // Unclosed: the remainder is all script, so none of it survives.
+            None => "",
+        };
+    }
+    strip_event_handlers(&out)
+}
+
+/// Remove `on…="…"` attributes and `javascript:` targets, wherever they sit.
+fn strip_event_handlers(html: &str) -> String {
+    let lower = html.to_lowercase();
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        let is_handler = lower[i..].starts_with(" on")
+            && lower[i + 3..].chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+        if is_handler {
+            // Skip the whole attribute, quoted value included.
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j] != b'=' && bytes[j] != b'>' && bytes[j] != b' ' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                match bytes.get(j) {
+                    Some(&q @ (b'"' | b'\'')) => {
+                        j += 1;
+                        while j < bytes.len() && bytes[j] != q {
+                            j += 1;
+                        }
+                        j = (j + 1).min(bytes.len());
+                    }
+                    _ => {
+                        while j < bytes.len() && bytes[j] != b' ' && bytes[j] != b'>' {
+                            j += 1;
+                        }
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        if lower[i..].starts_with("javascript:") {
+            out.push_str("about:blank");
+            i += "javascript:".len();
+            continue;
+        }
+        let ch = html[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
     out
 }
 
-/// Typed text as a mail body. Plain text, so it is escaped rather than
-/// interpreted, and its line breaks are kept by the layout rather than by
-/// sprinkling tags through it.
-pub fn text_as_html(text: &str) -> String {
+/// The composer document: what is being written, edited in place. The
+/// message being answered sits in the same body, below the header block,
+/// so trimming it works like anywhere else.
+pub fn editor_document(dark: bool, quoted: &str) -> String {
+    let (fg, bg, quote, link) = if dark {
+        ("#e3e3e3", "#1e1e1e", "#9a9a9a", "#7cb7f2")
+    } else {
+        ("#1a1a1a", "#ffffff", "#555555", "#0f6cbd")
+    };
     format!(
-        "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:11pt;\
-         white-space:pre-wrap\">{}</div>",
-        escape_html(text)
+        "<!doctype html><html><head><meta charset='utf-8'>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'><style>\
+         body{{font-family:'Segoe UI',Ubuntu,Cantarell,sans-serif;font-size:14px;\
+         line-height:1.5;color:{fg};background:{bg};margin:12px;\
+         overflow-wrap:break-word;}}\
+         body:focus{{outline:none;}}\
+         pre{{white-space:pre-wrap;font:inherit;}}\
+         img{{max-width:100%;height:auto;}}\
+         table{{max-width:100%;}}\
+         blockquote{{border-left:3px solid {quote};margin-left:0;padding-left:12px;color:{quote};}}\
+         a{{color:{link};}}\
+         </style></head><body contenteditable='true'><div><br></div><div><br></div>\
+         {quoted}</body></html>"
     )
 }
+
+/// The original message, quoted the way Outlook quotes it in a reply or
+
+/// Typed text as a mail body. Plain text, so it is escaped rather than
+/// interpreted, and its line breaks are kept by the layout rather than by
 
 /// A short, stable, filesystem-safe stand-in for a long opaque id.
 /// Graph attachment ids are hundreds of characters, which makes an ugly
@@ -381,68 +461,63 @@ mod cid_tests {
 }
 
 #[cfg(test)]
-mod quote_tests {
+mod compose_tests {
     use super::*;
 
-    /// A forward must reach the recipient looking as the original did,
-    /// so the original's own markup is left alone and what was typed goes
-    /// inside its body rather than in front of the document.
     #[test]
-    fn typed_text_goes_inside_the_original_document() {
-        let original = "<html><head><style>p{color:red}</style></head>\
-                        <body dir=\"ltr\"><p>Invoice attached</p></body></html>";
-        let sent = prepend_comment(original, "<div>Please handle this</div>");
-        assert!(sent.starts_with("<html><head>"), "the original's head survives");
-        assert!(sent.contains("<body dir=\"ltr\"><div>Please handle this</div><p>"));
-        assert!(sent.contains("<p>Invoice attached</p>"), "the original is untouched");
-    }
-
-    /// A fragment with no body tag still gets the text above it.
-    #[test]
-    fn a_bare_fragment_takes_the_text_in_front() {
-        let sent = prepend_comment("<p>Hello</p>", "<div>Note</div>");
-        assert_eq!(sent, "<div>Note</div><p>Hello</p>");
-    }
-
-    #[test]
-    fn a_forward_carries_the_original_and_says_who_sent_it() {
-        let quote = quoted_original(
-            true,
+    fn the_header_reads_the_way_outlook_writes_it() {
+        let block = original_message_block(
             "Mark de Jong <mark@fabrikam.nl>",
-            "Thursday 10 September 2026, 09:10",
+            "Monday, October 1, 2007 3:17 PM",
             "Vincent de Vries",
             "",
             "Licence renewal",
-            "Procurement approved the renewal.",
         );
-        assert!(quote.contains("Forwarded message"));
-        assert!(quote.contains("From: Mark de Jong <mark@fabrikam.nl>"));
-        assert!(quote.contains("Subject: Licence renewal"));
-        assert!(quote.contains("Procurement approved the renewal."));
-        // Room to type above it, as in Outlook.
-        assert!(quote.starts_with("\n\n"));
+        assert!(block.contains("-----Original Message-----"));
+        assert!(block.contains("From: Mark de Jong &lt;mark@fabrikam.nl&gt;"));
+        assert!(block.contains("Sent: Monday, October 1, 2007 3:17 PM"));
+        assert!(block.contains("To: Vincent de Vries"));
+        assert!(block.contains("Subject: Licence renewal"));
         // Nothing to say about a Cc nobody was on.
-        assert!(!quote.contains("Cc:"));
+        assert!(!block.contains("Cc:"));
+    }
+
+    /// The composer runs scripting to read back what was written, so a
+    /// message must not be able to bring scripting of its own.
+    #[test]
+    fn a_quoted_message_cannot_run_anything() {
+        let hostile = "<p>Hello</p><script>steal()</script>\
+                       <img src=x onerror=\"steal()\"><a href='javascript:steal()'>click</a>";
+        let safe = sanitize_for_editor(hostile);
+        assert!(safe.contains("Hello"), "the message itself survives");
+        assert!(!safe.to_lowercase().contains("<script"));
+        assert!(!safe.to_lowercase().contains("onerror"));
+        assert!(!safe.to_lowercase().contains("javascript:"));
+        assert!(safe.contains("<img"), "the picture is kept, only its handler goes");
     }
 
     #[test]
-    fn a_reply_quotes_without_calling_itself_a_forward() {
-        let quote = quoted_original(false, "A <a@b.c>", "", "", "", "Hello", "Body");
-        assert!(!quote.contains("Forwarded"));
-        assert!(quote.contains("From: A <a@b.c>"));
-        // An unknown date is left out rather than shown blank.
-        assert!(!quote.contains("Sent:"));
+    fn an_unclosed_script_takes_nothing_with_it() {
+        let safe = sanitize_for_editor("<p>Keep</p><script>never();");
+        assert!(safe.contains("Keep"));
+        assert!(!safe.contains("never()"));
     }
 
-    /// What is typed is mail, not markup: a body mentioning a tag must
-    /// arrive as that text rather than as an element.
     #[test]
-    fn typed_text_is_escaped_not_interpreted() {
-        let html = text_as_html("use <b> for bold\nsecond line");
-        assert!(html.contains("&lt;b&gt;"));
-        assert!(!html.contains("<b>"));
-        // Line breaks survive without tags sprinkled through the text.
-        assert!(html.contains("second line"));
-        assert!(html.contains("pre-wrap"));
+    fn formatting_and_pictures_are_left_alone() {
+        let mail = "<table><tr><td style='color:red'>Cell</td></tr></table>\
+                    <img src='data:image/png;base64,AAA'>";
+        assert_eq!(sanitize_for_editor(mail), mail);
+    }
+
+    /// The message is written above the quote, so that is where the
+    /// document opens.
+    #[test]
+    fn the_editor_opens_with_room_above_the_quote() {
+        let doc = editor_document(false, "<div>-----Original Message-----</div>");
+        assert!(doc.contains("contenteditable='true'"));
+        let typing_space = doc.find("<div><br></div>").expect("space to type in");
+        let quote = doc.find("-----Original Message-----").expect("the quote");
+        assert!(typing_space < quote, "the blank line comes first");
     }
 }

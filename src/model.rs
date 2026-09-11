@@ -130,6 +130,10 @@ pub struct Outgoing {
     pub cc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// The body is HTML rather than plain text. Older queued messages
+    /// have none of this field, and those were all plain text.
+    #[serde(default)]
+    pub is_html: bool,
     /// The message being replied to or forwarded, if any.
     #[serde(default)]
     pub in_reply_to: Option<String>,

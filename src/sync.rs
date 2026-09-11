@@ -268,7 +268,13 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
                 .folder_id_by_name("Sent Items")
                 .or_else(|| db.folder_id_by_name("Drafts"))
                 .unwrap_or_default();
-            let body = Body { is_html: false, content: message.body.clone() };
+            let body = Body { is_html: message.is_html, content: message.body.clone() };
+            // The list shows a line of the message, not its markup.
+            let preview: String = if message.is_html {
+                crate::util::html_to_text(&message.body)
+            } else {
+                message.body.clone()
+            };
             let summary = MessageSummary {
                 conversation_id: local_id.clone(),
                 thread_count: 1,
@@ -277,7 +283,7 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
                 subject: message.subject.clone(),
                 from: crate::model::Address::new("You", ""),
                 received: chrono::Utc::now().to_rfc3339(),
-                preview: message.body.chars().take(120).collect(),
+                preview: preview.chars().take(120).collect(),
                 is_read: true,
                 has_attachments: false,
                 pending: Pending::Queued,

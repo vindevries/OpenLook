@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 #[cfg(feature = "html-view")]
 use webkit::prelude::*;
 
@@ -14,34 +14,64 @@ use crate::ui::window::{self, State};
 pub struct ComposeWindow;
 
 impl ComposeWindow {
-    /// The message being answered or forwarded, rendered as it reads.
-    fn original_view(detail: &MessageDetail) -> gtk::Widget {
-        let (is_html, content) = match &detail.body {
-            Some(body) => (body.is_html, body.content.clone()),
-            None => (false, detail.summary.preview.clone()),
+    /// The message being answered, as it sits inside the reply: the
+    /// header Outlook writes above a quote, then the message itself.
+    fn quoted_html(detail: &MessageDetail) -> String {
+        let names = |list: &[crate::model::Address]| {
+            list.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", ")
         };
-        #[cfg(feature = "html-view")]
-        {
-            let view = webkit::WebView::new();
-            view.set_vexpand(true);
-            if let Some(settings) = webkit::prelude::WebViewExt::settings(&view) {
-                // Mail is untrusted content, the same as in the reading pane.
-                settings.set_enable_javascript(false);
-                settings.set_enable_html5_local_storage(false);
-                settings.set_enable_developer_extras(false);
+        let body = match &detail.body {
+            Some(body) if body.is_html => crate::util::sanitize_for_editor(&body.content),
+            Some(body) => format!("<pre>{}</pre>", crate::util::escape_html(&body.content)),
+            // Not downloaded — the preview is all the cache holds.
+            None => crate::util::escape_html(&detail.summary.preview),
+        };
+        let header = crate::util::original_message_block(
+            &format!("{} <{}>", detail.summary.from.display(), detail.summary.from.address),
+            &crate::util::fmt_outlook_time(&detail.summary.received),
+            &names(&detail.to),
+            &names(&detail.cc),
+            &detail.summary.subject,
+        );
+        format!("{header}{body}")
+    }
+
+    /// Hand a finished message to the mailbox, and close the window if it
+    /// was taken.
+    fn deliver(
+        state: &Rc<State>,
+        session_index: usize,
+        win: &adw::Window,
+        error: &gtk::Label,
+        message: Outgoing,
+    ) {
+        let op = Op::Send { local_id: format!("local:{}", glib::uuid_string_random()), message };
+        let (result, queued, demo) = {
+            let sessions = state.sessions.borrow();
+            match sessions.get(session_index) {
+                Some(session) => (session.apply(op), session.queued_count(), session.is_demo()),
+                None => (Ok(()), 0, true),
             }
-            let dark = adw::StyleManager::default().is_dark();
-            view.load_html(&crate::util::wrap_body(is_html, &content, dark), None);
-            gtk::Frame::builder().child(&view).build().upcast()
-        }
-        #[cfg(not(feature = "html-view"))]
-        {
-            let text =
-                if is_html { crate::util::html_to_text(&content) } else { content.clone() };
-            let label = gtk::Label::builder().xalign(0.0).yalign(0.0).wrap(true).label(text).build();
-            let scroll =
-                gtk::ScrolledWindow::builder().child(&label).vexpand(true).build();
-            gtk::Frame::builder().child(&scroll).build().upcast()
+        };
+        match result {
+            Ok(()) => {
+                window::reload_messages(state);
+                window::reload_folders(state, false);
+                window::render_status(state);
+                let note = if demo {
+                    "Message sent"
+                } else if queued > 0 {
+                    "Message queued — it will send when you're online"
+                } else {
+                    "Sending message…"
+                };
+                window::toast(state, note);
+                win.close();
+            }
+            Err(e) => {
+                error.set_text(&e.to_string());
+                error.set_visible(true);
+            }
         }
     }
 
@@ -128,50 +158,62 @@ impl ComposeWindow {
         fields.append(subject_row.row());
         content.append(&fields);
 
-        let body_view = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(8)
-            .right_margin(8)
-            .build();
-        let body_scroll = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
-        let editor = gtk::Frame::builder().child(&body_scroll).build();
+        // One box holding the whole message — what is written at the top,
+        // the original beneath its header — all of it editable, and all of
+        // it what the recipient gets.
+        let quoted = match &original {
+            Some(original) if !matches!(mode, SendMode::New) => Self::quoted_html(original),
+            _ => String::new(),
+        };
 
-        match &original {
-            // A reply or forward carries the message below whatever is
-            // typed. It goes out with its own formatting, so show it that
-            // way rather than as a flattened copy that would mislead.
-            Some(original) if !matches!(mode, SendMode::New) => {
-                let below = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                let caption = gtk::Label::builder()
-                    .xalign(0.0)
-                    .label(if matches!(mode, SendMode::Forward) {
-                        "Forwarded below, with its formatting and attachments"
-                    } else {
-                        "Quoted below"
-                    })
-                    .build();
-                caption.add_css_class("dim-label");
-                caption.add_css_class("caption");
-                below.append(&caption);
-                below.append(&Self::original_view(original));
-                let split = gtk::Paned::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .vexpand(true)
-                    .position(200)
-                    .resize_start_child(true)
-                    .resize_end_child(true)
-                    .build();
-                split.set_start_child(Some(&editor));
-                split.set_end_child(Some(&below));
-                content.append(&split);
+        #[cfg(feature = "html-view")]
+        let body_view = {
+            let view = webkit::WebView::new();
+            view.set_vexpand(true);
+            if let Some(settings) = webkit::prelude::WebViewExt::settings(&view) {
+                // Reading back what was written needs scripting; the quoted
+                // message has had its own scripting taken out first.
+                settings.set_enable_javascript(true);
+                settings.set_enable_html5_local_storage(false);
+                settings.set_enable_developer_extras(false);
             }
-            _ => {
-                editor.set_vexpand(true);
-                content.append(&editor);
+            let dark = adw::StyleManager::default().is_dark();
+            view.load_html(&crate::util::editor_document(dark, &quoted), None);
+            // Land the cursor where the message gets written: above the quote.
+            view.connect_load_changed(|view, event| {
+                if event == webkit::LoadEvent::Finished {
+                    view.evaluate_javascript(
+                        "document.body.focus();\
+                         var r=document.createRange();r.setStart(document.body,0);\
+                         r.collapse(true);var s=getSelection();\
+                         s.removeAllRanges();s.addRange(r);",
+                        None,
+                        None,
+                        gio::Cancellable::NONE,
+                        |_| {},
+                    );
+                }
+            });
+            view
+        };
+        #[cfg(not(feature = "html-view"))]
+        let body_view = {
+            let view = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .top_margin(8)
+                .bottom_margin(8)
+                .left_margin(8)
+                .right_margin(8)
+                .build();
+            if !quoted.is_empty() {
+                let buffer = view.buffer();
+                buffer.set_text(&format!("\n\n{}", crate::util::html_to_text(&quoted)));
+                buffer.place_cursor(&buffer.start_iter());
             }
-        }
+            view
+        };
+        let frame = gtk::Frame::builder().child(&body_view).vexpand(true).build();
+        content.append(&frame);
 
         let error_label = gtk::Label::builder().xalign(0.0).wrap(true).visible(false).build();
         error_label.add_css_class("error");
@@ -204,51 +246,44 @@ impl ComposeWindow {
                 error.set_visible(true);
                 return;
             }
-            let buffer = body_entry.buffer();
-            let body = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
             let subject = {
                 let s = subject_entry.text().to_string();
                 if s.trim().is_empty() { "(no subject)".to_string() } else { s }
             };
+            let state = state.clone();
+            let win = win.clone();
+            let error = error.clone();
+            let in_reply_to = original_id.clone();
 
-            let message = Outgoing {
-                to,
-                cc,
-                subject,
-                body,
-                in_reply_to: original_id.clone(),
-                mode,
-            };
-            let op =
-                Op::Send { local_id: format!("local:{}", glib::uuid_string_random()), message };
-            let (result, queued, demo) = {
-                let sessions = state.sessions.borrow();
-                match sessions.get(session_index) {
-                    Some(session) => {
-                        (session.apply(op), session.queued_count(), session.is_demo())
-                    }
-                    None => (Ok(()), 0, true),
-                }
-            };
-            match result {
-                Ok(()) => {
-                    window::reload_messages(&state);
-                    window::reload_folders(&state, false);
-                    window::render_status(&state);
-                    let note = if demo {
-                        "Message sent"
-                    } else if queued > 0 {
-                        "Message queued — it will send when you're online"
-                    } else {
-                        "Sending message…"
+            #[cfg(feature = "html-view")]
+            body_entry.evaluate_javascript(
+                "document.body.innerHTML",
+                None,
+                None,
+                gio::Cancellable::NONE,
+                move |result| {
+                    let body = match result {
+                        Ok(value) => value.to_str().to_string(),
+                        Err(e) => {
+                            error.set_text(&format!("Could not read the message: {e}"));
+                            error.set_visible(true);
+                            return;
+                        }
                     };
-                    window::toast(&state, note);
-                    win.close();
-                }
-                Err(e) => {
-                    error.set_text(&e.to_string());
-                    error.set_visible(true);
-                }
+                    let message =
+                        Outgoing { to, cc, subject, body, is_html: true, in_reply_to, mode };
+                    Self::deliver(&state, session_index, &win, &error, message);
+                },
+            );
+
+            #[cfg(not(feature = "html-view"))]
+            {
+                let buffer = body_entry.buffer();
+                let body =
+                    buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
+                let message =
+                    Outgoing { to, cc, subject, body, is_html: false, in_reply_to, mode };
+                Self::deliver(&state, session_index, &win, &error, message);
             }
         });
 
