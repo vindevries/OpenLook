@@ -1500,10 +1500,21 @@ fn show_row_menu(
     pages.set_hhomogeneous(false);
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-    let item = |label: &str, run: Box<dyn Fn()>| -> gtk::Button {
-        let button = gtk::Button::builder()
-            .child(&gtk::Label::builder().label(label).xalign(0.0).build())
-            .build();
+    // Icon, then label, as Outlook lays its menu out. A trailing icon
+    // marks the entry that leads somewhere rather than doing something.
+    let item = |icon: &str, label: &str, trailing: Option<&str>, run: Box<dyn Fn()>| {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let image = gtk::Image::from_icon_name(icon);
+        image.add_css_class("dim-label");
+        line.append(&image);
+        let text = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build();
+        line.append(&text);
+        if let Some(trailing) = trailing {
+            let arrow = gtk::Image::from_icon_name(trailing);
+            arrow.add_css_class("dim-label");
+            line.append(&arrow);
+        }
+        let button = gtk::Button::builder().child(&line).build();
         button.add_css_class("flat");
         button.add_css_class("menu-item");
         button.connect_clicked(move |_| run());
@@ -1529,14 +1540,16 @@ fn show_row_menu(
         }) as Box<dyn Fn()>
     };
 
-    for (label, mode) in [
-        ("Reply", SendMode::Reply),
-        ("Reply All", SendMode::ReplyAll),
-        ("Forward", SendMode::Forward),
+    for (icon, label, mode) in [
+        ("mail-reply-sender-symbolic", "Reply", SendMode::Reply),
+        ("mail-reply-all-symbolic", "Reply All", SendMode::ReplyAll),
+        ("mail-forward-symbolic", "Forward", SendMode::Forward),
     ] {
         let id = message.id.clone();
         page.append(&item(
+            icon,
             label,
+            None,
             later(
                 state,
                 &popover,
@@ -1546,10 +1559,18 @@ fn show_row_menu(
     }
     page.append(&separator());
 
-    for (label, read) in [("Mark as Read", true), ("Mark as Unread", false)] {
+    for (icon, label, read) in [
+        // The theme draws read and unread mail as the same envelope, so a
+        // tick marks the one that is done with; the envelope, as on the
+        // toolbar's own button, means put it back.
+        ("object-select-symbolic", "Mark as Read", true),
+        ("mail-unread-symbolic", "Mark as Unread", false),
+    ] {
         let id = message.id.clone();
         page.append(&item(
+            icon,
             label,
+            None,
             later(
                 state,
                 &popover,
@@ -1572,19 +1593,25 @@ fn show_row_menu(
     if !folders.is_empty() {
         let pages_for_move = pages.clone();
         page.append(&item(
+            "folder-open-symbolic",
             "Move",
+            Some("go-next-symbolic"),
             Box::new(move || pages_for_move.set_visible_child_name("move")),
         ));
     }
     let id = message.id.clone();
     page.append(&item(
+        "folder-symbolic",
         "Archive",
+        None,
         later(state, &popover, Box::new(move |s| archive_message(s, session, &id))),
     ));
     page.append(&separator());
     let id = message.id.clone();
     page.append(&item(
+        "user-trash-symbolic",
         "Delete",
+        None,
         later(state, &popover, Box::new(move |s| delete_message(s, session, &id))),
     ));
 
@@ -1592,7 +1619,7 @@ fn show_row_menu(
 
     if !folders.is_empty() {
         let move_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let back = item("← Move to", {
+        let back = item("go-previous-symbolic", "Move to", None, {
             let pages = pages.clone();
             Box::new(move || pages.set_visible_child_name("main"))
         });
@@ -1604,7 +1631,9 @@ fn show_row_menu(
             let folder_id = folder.id.clone();
             let name = folder.display_name.clone();
             move_page.append(&item(
+                folder_icon(&folder.display_name),
                 &folder.display_name,
+                None,
                 later(
                     state,
                     &popover,
