@@ -37,6 +37,8 @@ pub struct Folder {
     pub display_name: String,
     pub unread_count: i64,
     pub total_count: i64,
+    /// The folder this one sits in, when it is not at the top level.
+    pub parent_id: Option<String>,
 }
 
 /// Where a locally-composed message stands.

@@ -29,6 +29,10 @@ const DELTA_WINDOW_DAYS: i64 = 30;
 const SUMMARY_FIELDS: &str =
     "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,parentFolderId,conversationId";
 
+/// How far down a folder tree to go. Deep enough for any real mailbox,
+/// and a stop in case one points at itself.
+const FOLDER_DEPTH: usize = 8;
+
 /// Well-known folders first, in the order Outlook shows them.
 const FOLDER_ORDER: [&str; 7] =
     ["Inbox", "Drafts", "Sent Items", "Outbox", "Deleted Items", "Junk Email", "Archive"];
@@ -200,28 +204,55 @@ impl Graph {
             .ok_or_else(|| GraphError::Transient("Empty response".into()))
     }
 
+    /// Every folder in the mailbox, nested ones included. Graph lists only
+    /// the top level, so folders that say they have children are asked for
+    /// theirs in turn — which is the only way subfolders appear at all.
     pub async fn folders(&self) -> GraphResult<Vec<Folder>> {
-        let data = self
-            .get("/me/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount")
-            .await?;
-        let mut folders: Vec<Folder> = data["value"]
-            .as_array()
-            .map(|v| v.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .map(|f| Folder {
-                id: f["id"].as_str().unwrap_or_default().to_string(),
-                display_name: f["displayName"].as_str().unwrap_or("(folder)").to_string(),
-                unread_count: f["unreadItemCount"].as_i64().unwrap_or(0),
-                total_count: f["totalItemCount"].as_i64().unwrap_or(0),
-            })
-            .collect();
-        folders.sort_by(|a, b| {
+        const FOLDER_FIELDS: &str =
+            "id,displayName,unreadItemCount,totalItemCount,parentFolderId,childFolderCount";
+        let mut all: Vec<Folder> = Vec::new();
+        // Breadth-first, so a mailbox with a deep tree still lists its top
+        // level first, and bounded in case a mailbox nests absurdly.
+        let mut level: Vec<Option<String>> = vec![None];
+        for _ in 0..FOLDER_DEPTH {
+            if level.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for parent in level {
+                let url = match &parent {
+                    Some(id) => format!(
+                        "/me/mailFolders/{}/childFolders?$top=100&$select={FOLDER_FIELDS}",
+                        urlencoding::encode(id)
+                    ),
+                    None => format!("/me/mailFolders?$top=100&$select={FOLDER_FIELDS}"),
+                };
+                let data = self.get(&url).await?;
+                for f in data["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                    let id = f["id"].as_str().unwrap_or_default().to_string();
+                    if f["childFolderCount"].as_i64().unwrap_or(0) > 0 {
+                        next.push(Some(id.clone()));
+                    }
+                    all.push(Folder {
+                        id,
+                        display_name: f["displayName"].as_str().unwrap_or("(folder)").to_string(),
+                        unread_count: f["unreadItemCount"].as_i64().unwrap_or(0),
+                        total_count: f["totalItemCount"].as_i64().unwrap_or(0),
+                        // Top-level folders name the mailbox root as their
+                        // parent, which is not a folder anyone can open, so
+                        // only folders found under one carry a parent here.
+                        parent_id: parent.clone(),
+                    });
+                }
+            }
+            level = next;
+        }
+        all.sort_by(|a, b| {
             folder_rank(&a.display_name)
                 .cmp(&folder_rank(&b.display_name))
                 .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
         });
-        Ok(folders)
+        Ok(all)
     }
 
     /// Newest `top` messages in a folder — used for the first sync and as a

@@ -57,7 +57,7 @@ pub enum Scope {
 enum PaneRow {
     /// "Favorites", or a mailbox address. `key` identifies it for collapsing.
     Header { key: String, title: String },
-    Folder { session: usize, folder: Folder, favourite: bool },
+    Folder { session: usize, folder: Folder, favourite: bool, depth: usize, parent: bool },
     /// Shown under a mailbox that has nothing cached yet, so an empty
     /// section always says why.
     Notice { text: String, error: bool },
@@ -157,6 +157,8 @@ pub struct State {
     /// Ids of the messages in the conversation on show, so a body arriving
     /// for any of them refreshes the pane.
     current_thread: RefCell<Vec<String>>,
+    /// Folders opened to show what is inside them, by folder id.
+    expanded_folders: RefCell<HashSet<String>>,
     /// Conversations expanded in the list, by conversation id.
     expanded: RefCell<HashSet<String>>,
     threaded: Cell<bool>,
@@ -668,6 +670,7 @@ pub fn build(app: &adw::Application) {
         current: RefCell::new(None),
         current_message: RefCell::new(None),
         current_thread: RefCell::new(Vec::new()),
+        expanded_folders: RefCell::new(HashSet::new()),
         expanded: RefCell::new(HashSet::new()),
         threaded: Cell::new(crate::config::Settings::load().threaded()),
         scope: Cell::new(Scope::Mail),
@@ -1100,6 +1103,8 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                         session: index,
                         folder: inbox.clone(),
                         favourite: true,
+                        depth: 0,
+                        parent: false,
                     });
                 }
             } else {
@@ -1109,9 +1114,37 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                             session: index,
                             folder: folder.clone(),
                             favourite: true,
+                            depth: 0,
+                            parent: false,
                         });
                     }
                 }
+            }
+        }
+    }
+
+    /// Walk a mailbox's folders into pane rows: each folder followed by
+    /// the ones inside it, and those only while it is open.
+    fn nest(
+        state: &Rc<State>,
+        rows: &mut Vec<PaneRow>,
+        session: usize,
+        folders: &[Folder],
+        parent: Option<&str>,
+        depth: usize,
+    ) {
+        for folder in folders.iter().filter(|f| f.parent_id.as_deref() == parent) {
+            let has_children =
+                folders.iter().any(|f| f.parent_id.as_deref() == Some(folder.id.as_str()));
+            rows.push(PaneRow::Folder {
+                session,
+                folder: folder.clone(),
+                favourite: false,
+                depth,
+                parent: has_children,
+            });
+            if has_children && state.expanded_folders.borrow().contains(&folder.id) {
+                nest(state, rows, session, folders, Some(&folder.id), depth + 1);
             }
         }
     }
@@ -1144,9 +1177,7 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
             rows.push(PaneRow::Notice { text, error });
             continue;
         }
-        for folder in folders {
-            rows.push(PaneRow::Folder { session: index, folder: folder.clone(), favourite: false });
-        }
+        nest(state, &mut rows, index, folders, None, 0);
     }
 
     let selected = state.current.borrow().clone();
@@ -1161,7 +1192,7 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                 let collapsed = state.collapsed.borrow().contains(key);
                 pane_header_row(title, collapsed)
             }
-            PaneRow::Folder { session, folder, favourite } => {
+            PaneRow::Folder { session, folder, favourite, depth, parent } => {
                 let is_selected = selected.as_ref() == Some(&(*session, folder.id.clone()));
                 // With one mailbox the favourites duplicate the tree, so keep
                 // the selection on the tree copy.
@@ -1177,7 +1208,7 @@ pub fn reload_folders(state: &Rc<State>, select_default: bool) {
                 {
                     select_index = Some(index as i32);
                 }
-                folder_row(state, *session, folder, tickets_pane)
+                folder_row(state, *session, folder, tickets_pane, *depth, *parent)
             }
             PaneRow::Notice { text, error } => pane_notice_row(text, *error),
         };
@@ -1246,6 +1277,8 @@ fn folder_row(
     session: usize,
     folder: &Folder,
     tickets: bool,
+    depth: usize,
+    parent: bool,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
 
@@ -1283,9 +1316,40 @@ fn folder_row(
         .spacing(8)
         .margin_top(5)
         .margin_bottom(5)
-        .margin_start(20)
+        // Each level in, so the tree reads as a tree.
+        .margin_start(4 + depth as i32 * 14)
         .margin_end(6)
         .build();
+
+    // A folder holding folders opens in place, as it does in Outlook. The
+    // arrow is a button, so clicking it opens the folder's contents rather
+    // than selecting the folder itself.
+    if parent {
+        let open = state.expanded_folders.borrow().contains(&folder.id);
+        let arrow = gtk::Button::builder()
+            .icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" })
+            .tooltip_text(if open { "Hide folders" } else { "Show folders" })
+            .build();
+        arrow.add_css_class("flat");
+        arrow.add_css_class("thread-arrow");
+        let state_for_arrow = state.clone();
+        let id = folder.id.clone();
+        arrow.connect_clicked(move |_| {
+            {
+                let mut expanded = state_for_arrow.expanded_folders.borrow_mut();
+                if !expanded.remove(&id) {
+                    expanded.insert(id.clone());
+                }
+            }
+            reload_folders(&state_for_arrow, false);
+        });
+        row_box.append(&arrow);
+    } else {
+        // Line the name up with the ones that have an arrow.
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_size_request(16, 1);
+        row_box.append(&spacer);
+    }
     row_box.append(&gtk::Image::from_icon_name(folder_icon(&folder.display_name)));
     let name = gtk::Label::builder()
         .label(&folder.display_name)

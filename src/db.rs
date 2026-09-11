@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS folders (
     unread_count INTEGER NOT NULL DEFAULT 0,
     total_count  INTEGER NOT NULL DEFAULT 0,
     sort_order   INTEGER NOT NULL DEFAULT 100,
-    delta_link   TEXT
+    delta_link   TEXT,
+    parent_id    TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY,
@@ -118,6 +119,9 @@ impl Db {
         ] {
             let _ = conn.execute(statement, []);
         }
+        // Folders cached before subfolders were fetched have no parent,
+        // and the next folder sync fills them in.
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN parent_id TEXT", []);
         // Adding the conversation column succeeds exactly once. Cached mail
         // predates it, so drop the delta cursors at the same moment and let
         // the next sync refill the rows with their thread.
@@ -170,7 +174,7 @@ impl Db {
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, display_name, unread_count, total_count
+            "SELECT id, display_name, unread_count, total_count, parent_id
                FROM folders ORDER BY sort_order, display_name COLLATE NOCASE",
         )?;
         let rows = stmt
@@ -180,6 +184,7 @@ impl Db {
                     display_name: r.get(1)?,
                     unread_count: r.get(2)?,
                     total_count: r.get(3)?,
+                    parent_id: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -193,13 +198,15 @@ impl Db {
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO folders (id, display_name, unread_count, total_count, sort_order)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO folders
+                     (id, display_name, unread_count, total_count, sort_order, parent_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                      display_name = excluded.display_name,
                      unread_count = excluded.unread_count,
                      total_count  = excluded.total_count,
-                     sort_order   = excluded.sort_order",
+                     sort_order   = excluded.sort_order,
+                     parent_id    = excluded.parent_id",
             )?;
             for f in folders {
                 stmt.execute(params![
@@ -207,7 +214,8 @@ impl Db {
                     f.display_name,
                     f.unread_count,
                     f.total_count,
-                    folder_rank(&f.display_name)
+                    folder_rank(&f.display_name),
+                    f.parent_id
                 ])?;
             }
             if !folders.is_empty() {

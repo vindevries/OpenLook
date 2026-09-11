@@ -470,6 +470,8 @@ impl Engine {
                     display_name: section.name.clone(),
                     unread_count: 0,
                     total_count: 0,
+                    // A connector's sections are a flat list for now.
+                    parent_id: None,
                 })
                 .collect();
             if self.db.upsert_folders(&folders).is_ok() {

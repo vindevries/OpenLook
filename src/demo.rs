@@ -38,17 +38,27 @@ pub fn seed(db: &Db) -> Result<()> {
         "Junk Email",
         "Archive",
     ];
-    let folder_rows: Vec<Folder> = folders
+    // A couple of folders inside the inbox, because a real mailbox has
+    // them and a demo that never nests hides how the pane behaves.
+    let nested = [("Projects", "inbox"), ("Newsletters", "inbox")];
+    let mut folder_rows: Vec<Folder> = folders
         .iter()
         .map(|name| Folder {
             id: name.to_lowercase().replace(' ', "_"),
             display_name: (*name).to_string(),
             unread_count: 0,
             total_count: 0,
+            parent_id: None,
         })
         .collect();
+    folder_rows.extend(nested.iter().map(|(name, parent)| Folder {
+        id: name.to_lowercase().replace(' ', "_"),
+        display_name: (*name).to_string(),
+        unread_count: 0,
+        total_count: 0,
+        parent_id: Some((*parent).to_string()),
+    }));
     // Keep Outlook's ordering even though these are synthetic folders.
-    let mut folder_rows = folder_rows;
     folder_rows.sort_by_key(|f| folder_rank(&f.display_name));
     db.upsert_folders(&folder_rows)?;
 
