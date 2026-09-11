@@ -14,6 +14,8 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::model::{Address, Body, MessageSummary, Pending};
+
 const API: &str = "https://api.hubapi.com";
 /// Ticket→conversation association that actually yields a conversation
 /// thread. A ticket is also associated with type 278, whose ids the
@@ -66,6 +68,22 @@ impl From<reqwest::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Seen from the sync engine, a HubSpot failure is just a failure of a
+/// connector — but it keeps its own wording, which says what went wrong
+/// in terms of the service the user actually has to go and fix.
+impl From<Error> for crate::connector::Error {
+    fn from(e: Error) -> Self {
+        use crate::connector::Error as Shared;
+        match e {
+            Error::Offline(m) => Shared::Offline(m),
+            Error::Auth(m) => Shared::Auth(format!("HubSpot refused the token: {m}")),
+            Error::NotFound => Shared::NotFound,
+            Error::Transient(m) => Shared::Transient(m),
+            Error::Permanent(m) => Shared::Permanent(m),
+        }
+    }
+}
 
 /// A stage in the ticket pipeline. These become folders in the pane.
 #[derive(Debug, Clone)]
@@ -539,6 +557,151 @@ pub fn assemble_ticket_html(description: &str, threads: &[(String, Vec<ThreadMes
         html.push_str("<p>No correspondence on this ticket yet.</p>");
     }
     html
+}
+
+/// One ticket pipeline, as the panes see it: stages are sections, tickets
+/// are items, and a ticket's body is its description followed by whatever
+/// correspondence hangs off it.
+pub struct TicketPipeline {
+    client: HubSpot,
+    pipeline: String,
+    /// Stages are asked for twice in a sync — once to build the folder
+    /// pane, once to know which of them count as closed — and they change
+    /// about as often as the pipeline itself. Fetch them once per pass.
+    stages: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Stage>)>>,
+}
+
+/// How long a fetched set of stages stands. Long enough to cover one sync,
+/// short enough that renaming a stage shows up while you watch.
+const STAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl TicketPipeline {
+    pub fn new(client: HubSpot, pipeline: String) -> Self {
+        Self { client, pipeline, stages: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn stages(&self) -> Result<Vec<Stage>> {
+        let mut cached = self.stages.lock().await;
+        if let Some((fetched, stages)) = cached.as_ref() {
+            if fetched.elapsed() < STAGE_TTL {
+                return Ok(stages.clone());
+            }
+        }
+        let stages = self.client.stages_of(&self.pipeline).await?;
+        *cached = Some((std::time::Instant::now(), stages.clone()));
+        Ok(stages)
+    }
+}
+
+impl crate::connector::Connector for TicketPipeline {
+    fn items_called(&self) -> &str {
+        "tickets"
+    }
+
+    fn sections(&self) -> crate::connector::Task<'_, Vec<crate::connector::Section>> {
+        Box::pin(async move {
+            let stages = self.stages().await?;
+            Ok(stages
+                .into_iter()
+                .map(|stage| crate::connector::Section { id: stage.id, name: stage.label })
+                .collect())
+        })
+    }
+
+    fn items(&self) -> crate::connector::Task<'_, Vec<MessageSummary>> {
+        Box::pin(async move {
+            // Which stages count as closed decides how much of the past is
+            // worth fetching, so the stages come first.
+            let closed: Vec<String> = self
+                .stages()
+                .await?
+                .into_iter()
+                .filter(|stage| stage.closed)
+                .map(|stage| stage.id)
+                .collect();
+            // Every open ticket, plus a slice of recent closed ones.
+            let tickets = self.client.tickets_for_pipeline(&self.pipeline, &closed, 200).await?;
+
+            // One request for every contact, rather than one per ticket.
+            let mut contact_ids: Vec<String> =
+                tickets.iter().filter_map(|t| t.contact_ids.first().cloned()).collect();
+            contact_ids.sort();
+            contact_ids.dedup();
+            let mut names = std::collections::HashMap::new();
+            for chunk in contact_ids.chunks(100) {
+                if let Ok(contacts) = self.client.contacts_batch(chunk).await {
+                    for contact in contacts {
+                        names.insert(contact.id.clone(), contact);
+                    }
+                }
+            }
+
+            Ok(tickets
+                .iter()
+                .map(|t| {
+                    let contact = t.contact_ids.first().and_then(|id| names.get(id));
+                    MessageSummary {
+                        // A ticket is its own thread.
+                        conversation_id: t.id.clone(),
+                        thread_count: 1,
+                        id: t.id.clone(),
+                        folder_id: t.stage_id.clone(),
+                        subject: t.subject.clone(),
+                        from: match contact {
+                            Some(c) if !c.name.trim().is_empty() => {
+                                Address::new(c.name.clone(), c.email.clone())
+                            }
+                            Some(c) => Address::bare(c.email.clone()),
+                            None => Address::new("(no contact)", ""),
+                        },
+                        received: t.updated.clone(),
+                        preview: crate::util::html_to_text(&t.content).chars().take(140).collect(),
+                        is_read: true,
+                        has_attachments: false,
+                        pending: Pending::None,
+                    }
+                })
+                .collect())
+        })
+    }
+
+    /// Assemble a ticket's correspondence: its description when it has
+    /// one, then each associated thread in turn. Threads stay labelled
+    /// rather than being silently merged, because a ticket often has
+    /// several.
+    fn body<'a>(
+        &'a self,
+        item: &'a MessageSummary,
+    ) -> crate::connector::Task<'a, crate::connector::ItemBody> {
+        Box::pin(async move {
+            let threads = self.client.ticket_threads(&item.id).await?;
+            let mut collected: Vec<(String, Vec<ThreadMessage>)> = Vec::new();
+            let mut first_failure = None;
+            for thread in &threads {
+                match self.client.thread_messages(thread).await {
+                    Ok(messages) => collected.push((thread.clone(), messages)),
+                    // A thread that has gone is simply not shown; the rest
+                    // of the ticket still reads fine.
+                    Err(Error::NotFound) => continue,
+                    Err(e) => first_failure = first_failure.or(Some(e)),
+                }
+            }
+            // Nothing came back and something went wrong: say so rather
+            // than caching an empty ticket.
+            if collected.is_empty() {
+                if let Some(e) = first_failure {
+                    return Err(e.into());
+                }
+            }
+            // A ticket raised through a web form has no thread; its own
+            // text is the only thing to show until someone answers.
+            let description = crate::util::escape_html(&item.preview);
+            Ok(crate::connector::ItemBody {
+                body: Body { is_html: true, content: assemble_ticket_html(&description, &collected) },
+                threads,
+            })
+        })
+    }
 }
 
 #[cfg(test)]

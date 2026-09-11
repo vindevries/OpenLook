@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::Auth;
 use crate::config::{account_key, db_path};
+use crate::connector::Connector;
 use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
 use crate::hubspot::HubSpot;
@@ -183,10 +184,10 @@ impl Session {
                 Backend::Mail(Graph::new(http, auth, account.username.clone()))
             }
             Mode::Tickets { pipeline_id, .. } => match crate::config::hubspot_token() {
-                Some(token) => Backend::Tickets {
-                    client: HubSpot::new(http, token),
-                    pipeline: pipeline_id.clone(),
-                },
+                Some(token) => Backend::Items(Arc::new(crate::hubspot::TicketPipeline::new(
+                    HubSpot::new(http, token),
+                    pipeline_id.clone(),
+                ))),
                 // Without a token there is nothing to sync; the cache still
                 // serves whatever was fetched before.
                 None => Backend::Demo,
@@ -303,10 +304,20 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
 enum Backend {
     Demo,
     Mail(Graph),
-    Tickets { client: HubSpot, pipeline: String },
+    /// Anything that is not mail: tickets, queues, whatever a connector
+    /// offers. The engine knows only the trait.
+    Items(Arc<dyn Connector>),
 }
 
 impl Backend {
+    /// The connector, for the paths that are not mail.
+    fn items(&self) -> Option<Arc<dyn Connector>> {
+        match self {
+            Backend::Items(connector) => Some(connector.clone()),
+            _ => None,
+        }
+    }
+
     /// The Graph client, for the mail-only paths.
     fn mail(&self) -> Option<Graph> {
         match self {
@@ -434,96 +445,48 @@ impl Engine {
         }
     }
 
-    /// Stages become folders and tickets become rows, so the existing mail
-    /// panes show tickets without knowing anything about HubSpot.
-    async fn sync_tickets(&mut self) {
-        let Backend::Tickets { client, pipeline } = &self.backend else { return };
-        let (client, pipeline) = (client.clone(), pipeline.clone());
+    /// Sections become folders and items become rows, so the panes built
+    /// for mail show a connector's contents without knowing what they are.
+    async fn sync_items(&mut self) {
+        let Some(connector) = self.backend.items() else { return };
         self.status.syncing = true;
         self.publish_status();
 
-        let stages = client.stages_of(&pipeline).await;
-        self.note_hubspot(&stages);
-        let closed_stages: Vec<String> = stages
-            .as_ref()
-            .map(|s| s.iter().filter(|s| s.closed).map(|s| s.id.clone()).collect())
-            .unwrap_or_default();
-        if let Ok(stages) = &stages {
-            let folders: Vec<Folder> = stages
+        let sections = connector.sections().await;
+        self.note_items(&sections);
+        if let Ok(sections) = &sections {
+            let folders: Vec<Folder> = sections
                 .iter()
-                .map(|s| Folder {
-                    id: s.id.clone(),
-                    display_name: s.label.clone(),
+                .map(|section| Folder {
+                    id: section.id.clone(),
+                    display_name: section.name.clone(),
                     unread_count: 0,
                     total_count: 0,
                 })
                 .collect();
             if self.db.upsert_folders(&folders).is_ok() {
-                // Keep HubSpot's own stage sequence: New … Closed, not the
-                // alphabetical order the mail ranking falls back to.
-                for (position, stage) in stages.iter().enumerate() {
-                    let _ = self.db.set_folder_sort(&stage.id, position as i64);
+                // Keep the connector's own order — New … Closed, say —
+                // rather than the alphabetical ranking mail falls back to.
+                for (position, section) in sections.iter().enumerate() {
+                    let _ = self.db.set_folder_sort(&section.id, position as i64);
                 }
                 self.emit(Event::FoldersChanged);
             }
         }
 
-        // Every open ticket, plus a slice of recent closed ones.
-        let tickets = client.tickets_for_pipeline(&pipeline, &closed_stages, 200).await;
-        self.note_hubspot(&tickets);
-        let Ok(tickets) = tickets else {
+        let items = connector.items().await;
+        self.note_items(&items);
+        let Ok(rows) = items else {
             self.status.syncing = false;
             self.publish_status();
             return;
         };
-
-        // One request for every contact, rather than one per ticket.
-        let contact_ids: Vec<String> = {
-            let mut ids: Vec<String> =
-                tickets.iter().filter_map(|t| t.contact_ids.first().cloned()).collect();
-            ids.sort();
-            ids.dedup();
-            ids
-        };
-        let mut names = std::collections::HashMap::new();
-        for chunk in contact_ids.chunks(100) {
-            if let Ok(contacts) = client.contacts_batch(chunk).await {
-                for contact in contacts {
-                    names.insert(contact.id.clone(), contact);
-                }
-            }
-        }
-
-        let rows: Vec<MessageSummary> = tickets
-            .iter()
-            .map(|t| {
-                let contact = t.contact_ids.first().and_then(|id| names.get(id));
-                MessageSummary {
-                    // A ticket is its own thread.
-                    conversation_id: t.id.clone(),
-                    thread_count: 1,
-                    id: t.id.clone(),
-                    folder_id: t.stage_id.clone(),
-                    subject: t.subject.clone(),
-                    from: match contact {
-                        Some(c) if !c.name.trim().is_empty() => {
-                            crate::model::Address::new(c.name.clone(), c.email.clone())
-                        }
-                        Some(c) => crate::model::Address::bare(c.email.clone()),
-                        None => crate::model::Address::new("(no contact)", ""),
-                    },
-                    received: t.updated.clone(),
-                    preview: crate::util::html_to_text(&t.content).chars().take(140).collect(),
-                    is_read: true,
-                    has_attachments: false,
-                    pending: Pending::None,
-                }
-            })
-            .collect();
         let _ = self.db.upsert_messages(&rows);
         let _ = self.db.recompute_counts();
         self.emit(Event::FoldersChanged);
-        for folder in rows.iter().map(|r| r.folder_id.clone()).collect::<std::collections::HashSet<_>>() {
+        for folder in
+            rows.iter().map(|r| r.folder_id.clone()).collect::<std::collections::HashSet<_>>()
+        {
             self.emit(Event::MessagesChanged(folder));
         }
         let _ = self.db.set_meta("last_sync", &now_unix().to_string());
@@ -531,61 +494,34 @@ impl Engine {
         self.publish_status();
     }
 
-    /// Assemble a ticket's correspondence: its description when it has one,
-    /// then each associated thread in turn. Threads stay labelled rather
-    /// than being silently merged, because a ticket often has several.
-    async fn ensure_ticket_body(&mut self, ticket_id: &str) {
-        let Backend::Tickets { client, .. } = &self.backend else { return };
-        let client = client.clone();
-        let cached = matches!(self.db.message(ticket_id), Ok(Some(m)) if m.body.is_some());
-        if cached {
+    /// Fetch an item's body once, then serve it from the cache.
+    async fn ensure_item_body(&mut self, id: &str) {
+        let Some(connector) = self.backend.items() else { return };
+        let Ok(Some(item)) = self.db.message(id) else { return };
+        if item.body.is_some() {
             return;
         }
-        let threads = client.ticket_threads(ticket_id).await;
-        self.note_hubspot(&threads);
-        let Ok(threads) = threads else { return };
-
-        let mut collected: Vec<(String, Vec<crate::hubspot::ThreadMessage>)> = Vec::new();
-        for thread in &threads {
-            match client.thread_messages(thread).await {
-                Ok(messages) => {
-                    self.status.online = true;
-                    collected.push((thread.clone(), messages));
-                }
-                // A thread that has gone is simply not shown; the rest of
-                // the ticket still reads fine.
-                Err(crate::hubspot::Error::NotFound) => continue,
-                Err(e) => self.note_hubspot(&Err::<(), _>(e)),
-            }
-        }
-        // A ticket raised through a web form has no thread; its own text is
-        // the only thing to show until someone answers.
-        let description = self
-            .db
-            .message(ticket_id)
-            .ok()
-            .flatten()
-            .map(|m| crate::util::escape_html(&m.summary.preview))
-            .unwrap_or_default();
-        let html = crate::hubspot::assemble_ticket_html(&description, &collected);
-
-        let body = Body { is_html: true, content: html };
-        if self.db.set_body(ticket_id, &body, &[], &[]).is_ok() {
-            let _ = self.db.set_thread_ids(ticket_id, &threads);
-            self.emit(Event::BodyReady(ticket_id.to_string()));
+        let content = connector.body(&item.summary).await;
+        self.note_items(&content);
+        let Ok(content) = content else { return };
+        if self.db.set_body(id, &content.body, &[], &[]).is_ok() {
+            let _ = self.db.set_thread_ids(id, &content.threads);
+            self.emit(Event::BodyReady(id.to_string()));
         }
     }
 
-    /// HubSpot failures get the same treatment as Graph ones.
-    fn note_hubspot<T>(&mut self, result: &std::result::Result<T, crate::hubspot::Error>) {
+    /// A connector's failures get the same treatment as Graph's.
+    fn note_items<T>(&mut self, result: &std::result::Result<T, crate::connector::Error>) {
         match result {
             Ok(_) => {
                 self.status.online = true;
                 self.status.detail = None;
             }
             Err(e) if e.is_offline() => {
+                let called = self.backend.items().map(|c| c.items_called().to_string());
                 self.status.online = false;
-                self.status.detail = Some("Offline — showing cached tickets".into());
+                self.status.detail =
+                    Some(format!("Offline — showing cached {}", called.as_deref().unwrap_or("items")));
             }
             Err(e) => {
                 let message = format!("{}: {e}", self.label);
@@ -597,9 +533,9 @@ impl Engine {
     }
 
     async fn sync_all(&mut self, folder: Option<String>) {
-        if matches!(self.backend, Backend::Tickets { .. }) {
+        if self.backend.items().is_some() {
             let _ = folder;
-            self.sync_tickets().await;
+            self.sync_items().await;
             return;
         }
         let Some(graph) = self.backend.mail() else {
@@ -637,9 +573,9 @@ impl Engine {
     }
 
     async fn sync_folder(&mut self, folder_id: &str) {
-        if matches!(self.backend, Backend::Tickets { .. }) {
+        if self.backend.items().is_some() {
             let _ = folder_id;
-            self.sync_tickets().await;
+            self.sync_items().await;
             return;
         }
         let Some(graph) = self.backend.mail() else { return };
@@ -814,8 +750,8 @@ impl Engine {
     }
 
     async fn ensure_body(&mut self, id: &str) {
-        if matches!(self.backend, Backend::Tickets { .. }) {
-            self.ensure_ticket_body(id).await;
+        if self.backend.items().is_some() {
+            self.ensure_item_body(id).await;
             return;
         }
         let cached = matches!(self.db.message(id), Ok(Some(m)) if m.body.is_some());

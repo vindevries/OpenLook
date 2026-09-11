@@ -8,6 +8,7 @@
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod connector;
 pub mod db;
 pub mod demo;
 pub mod graph;
