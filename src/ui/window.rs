@@ -131,6 +131,9 @@ pub struct State {
     count_label: gtk::Label,
     connection_label: gtk::Label,
     pub calendar: crate::ui::calendar::CalendarUi,
+    /// The alert on screen for each mailbox: its id, and the message it
+    /// opens when clicked.
+    alerts: RefCell<std::collections::HashMap<usize, (u32, String)>>,
     /// The attachment the user asked for, waiting on its download.
     opening_attachment: RefCell<Option<(String, String)>>,
     /// Appointment windows currently open, so a body can be filled in.
@@ -649,6 +652,7 @@ pub fn build(app: &adw::Application) {
         count_label,
         connection_label,
         calendar,
+        alerts: RefCell::new(std::collections::HashMap::new()),
         opening_attachment: RefCell::new(None),
         appointments: RefCell::new(Vec::new()),
         view_stack,
@@ -886,6 +890,8 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         action.connect_activate(move |_, _| handler(&s));
         state.window.add_action(&action);
     }
+
+    watch_alert_clicks(state);
 
     // Clicking a new-mail notification raises the window on that message.
     let show_mail = gio::SimpleAction::new(
@@ -1492,24 +1498,27 @@ fn parse_drag_payload(payload: &str) -> Option<(usize, &str)> {
     Some((session.parse().ok()?, id))
 }
 
-/// Tell the desktop that mail has arrived. One notification per mailbox,
-/// replaced rather than stacked, so a busy inbox does not bury the screen.
+/// How long a new-mail alert stays on screen. Long enough to read who it
+/// is from and what it is about, short enough to be gone before it is in
+/// the way.
+const ALERT_SECONDS: u32 = 4;
+
+/// Tell the desktop that mail has arrived. One alert per mailbox, replaced
+/// rather than stacked, so a busy inbox does not bury the screen.
 fn announce_new_mail(state: &Rc<State>, session: usize, arrivals: &[MessageSummary]) {
     if arrivals.is_empty() || !Settings::load().notify_new_mail() {
         return;
     }
-    let Some(app) = state.window.application() else { return };
     let mailbox = state
         .sessions
         .borrow()
         .get(session)
         .map(|s| s.mode.label())
         .unwrap_or_else(|| "Mail".into());
-
-    let notification = gio::Notification::new(&match arrivals {
+    let summary = match arrivals {
         [one] => format!("{} — {mailbox}", one.from.display()),
         many => format!("{} new messages — {mailbox}", many.len()),
-    });
+    };
     let body = match arrivals {
         [one] => one.subject.clone(),
         many => many
@@ -1519,17 +1528,148 @@ fn announce_new_mail(state: &Rc<State>, session: usize, arrivals: &[MessageSumma
             .collect::<Vec<_>>()
             .join("\n"),
     };
-    notification.set_body(Some(&body));
-    notification.set_icon(&gio::ThemedIcon::new("mail-unread-symbolic"));
-    // Clicking it brings the window up on that message.
-    if let Some(first) = arrivals.first() {
-        notification.set_default_action_and_target_value(
-            "app.show-mail",
-            Some(&(session as u32, first.id.as_str()).to_variant()),
-        );
+    let opens = arrivals.first().map(|m| m.id.clone()).unwrap_or_default();
+    if !send_alert(state, session, &summary, &body, &opens) {
+        // No notification service: fall back to the desktop's own handling,
+        // which at least gets the message across.
+        send_alert_via_portal(state, session, &summary, &body, &opens);
     }
-    // One id per mailbox: a second batch replaces the first rather than
-    // piling up.
+}
+
+/// Raise the alert through the desktop's notification service, which is the
+/// only route that takes a lifetime: `GNotification` has no say in how long
+/// a banner stays, and one that waits to be clicked away is in the way.
+fn send_alert(
+    state: &Rc<State>,
+    session: usize,
+    summary: &str,
+    body: &str,
+    opens: &str,
+) -> bool {
+    let Some(connection) = state.window.application().and_then(|app| app.dbus_connection())
+    else {
+        return false;
+    };
+    let replaces = state.alerts.borrow().get(&session).map(|(id, _)| *id).unwrap_or(0);
+    let hints: std::collections::HashMap<String, glib::Variant> = [
+        ("desktop-entry".to_string(), crate::config::APP_ID.to_variant()),
+        // Normal urgency: an alert that expires on its own, unlike a
+        // critical one, which the desktop is entitled to keep up.
+        ("urgency".to_string(), 1u8.to_variant()),
+    ]
+    .into_iter()
+    .collect();
+    let params = (
+        "OpenLook",
+        replaces,
+        "mail-unread-symbolic",
+        summary,
+        body,
+        vec!["default", "Open"],
+        hints,
+        (ALERT_SECONDS * 1000) as i32,
+    )
+        .to_variant();
+
+    let state_for_reply = state.clone();
+    let opens = opens.to_string();
+    connection.call(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "Notify",
+        Some(&params),
+        Some(glib::VariantTy::new("(u)").expect("valid variant type")),
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        move |reply| {
+            let Ok(reply) = reply else { return };
+            let Some((id,)) = reply.get::<(u32,)>() else { return };
+            state_for_reply.alerts.borrow_mut().insert(session, (id, opens.clone()));
+            // Some desktops treat the lifetime as advice. Take the alert
+            // down ourselves once it has had its time, so it never becomes
+            // something to clear away by hand.
+            let state = state_for_reply.clone();
+            glib::timeout_add_seconds_local_once(ALERT_SECONDS + 1, move || {
+                close_alert(&state, session, id);
+            });
+        },
+    );
+    true
+}
+
+/// Ask the desktop to take an alert down.
+fn close_alert(state: &Rc<State>, session: usize, id: u32) {
+    let Some(connection) = state.window.application().and_then(|app| app.dbus_connection())
+    else {
+        return;
+    };
+    if state.alerts.borrow().get(&session).map(|(open, _)| *open) == Some(id) {
+        state.alerts.borrow_mut().remove(&session);
+    }
+    connection.call(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "CloseNotification",
+        Some(&(id,).to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        |_| {},
+    );
+}
+
+/// Listen for someone clicking an alert, so it can open the message it
+/// was raised for.
+fn watch_alert_clicks(state: &Rc<State>) {
+    let Some(connection) = state.window.application().and_then(|app| app.dbus_connection())
+    else {
+        return;
+    };
+    let state = state.clone();
+    connection.signal_subscribe(
+        Some("org.freedesktop.Notifications"),
+        Some("org.freedesktop.Notifications"),
+        Some("ActionInvoked"),
+        Some("/org/freedesktop/Notifications"),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |_, _, _, _, _, params| {
+            let Some((id, _action)) = params.get::<(u32, String)>() else { return };
+            let opened = state
+                .alerts
+                .borrow()
+                .iter()
+                .find(|(_, (alert, _))| *alert == id)
+                .map(|(session, (_, message))| (*session, message.clone()));
+            if let Some((session, message)) = opened {
+                state.window.present();
+                reveal_message(&state, session, &message);
+            }
+        },
+    );
+}
+
+/// Without a notification service, hand the alert to the desktop the way
+/// any GTK application would.
+fn send_alert_via_portal(
+    state: &Rc<State>,
+    session: usize,
+    summary: &str,
+    body: &str,
+    opens: &str,
+) {
+    let Some(app) = state.window.application() else { return };
+    let notification = gio::Notification::new(summary);
+    notification.set_body(Some(body));
+    notification.set_icon(&gio::ThemedIcon::new("mail-unread-symbolic"));
+    notification.set_default_action_and_target_value(
+        "app.show-mail",
+        Some(&(session as u32, opens).to_variant()),
+    );
     app.send_notification(Some(&format!("new-mail-{session}")), &notification);
 }
 
