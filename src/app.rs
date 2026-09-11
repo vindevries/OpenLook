@@ -113,6 +113,13 @@ const CSS: &str = r#"
   border-radius: 6px;
 }
 
+/* Right-click menu, built from buttons so each one acts on its own row */
+.menu-item {
+  padding: 6px 14px;
+  min-height: 22px;
+  border-radius: 4px;
+}
+
 .attachment-chip {
   padding: 4px 10px;
   border-radius: 6px;

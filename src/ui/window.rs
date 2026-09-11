@@ -1475,6 +1475,167 @@ fn parse_drag_payload(payload: &str) -> Option<(usize, &str)> {
     Some((session.parse().ok()?, id))
 }
 
+/// Outlook's right-click menu, with the commands this client can carry
+/// out. It acts on the row the pointer is over rather than on whatever the
+/// reading pane holds, so each entry closes over that message.
+fn show_row_menu(
+    state: &Rc<State>,
+    row: &gtk::ListBoxRow,
+    session: usize,
+    message: &MessageSummary,
+    x: f64,
+    y: f64,
+) {
+    let popover = gtk::Popover::builder().has_arrow(false).build();
+    popover.add_css_class("menu");
+    popover.set_parent(row);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    let pages = gtk::Stack::new();
+    // Each page stands on its own height: without this the menu is as tall
+    // as the folder list hiding behind it.
+    pages.set_vhomogeneous(false);
+    pages.set_hhomogeneous(false);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let item = |label: &str, run: Box<dyn Fn()>| -> gtk::Button {
+        let button = gtk::Button::builder()
+            .child(&gtk::Label::builder().label(label).xalign(0.0).build())
+            .build();
+        button.add_css_class("flat");
+        button.add_css_class("menu-item");
+        button.connect_clicked(move |_| run());
+        button
+    };
+    let separator = || {
+        let line = gtk::Separator::new(gtk::Orientation::Horizontal);
+        line.set_margin_top(4);
+        line.set_margin_bottom(4);
+        line
+    };
+    // Every command runs after the menu is down, so the list can rebuild
+    // without pulling the popover's own parent out from under it.
+    let later = |state: &Rc<State>, popover: &gtk::Popover, run: Box<dyn Fn(&Rc<State>)>| {
+        let state = state.clone();
+        let popover = popover.clone();
+        let run = Rc::new(run);
+        Box::new(move || {
+            popover.popdown();
+            let state = state.clone();
+            let run = run.clone();
+            glib::idle_add_local_once(move || run(&state));
+        }) as Box<dyn Fn()>
+    };
+
+    for (label, mode) in [
+        ("Reply", SendMode::Reply),
+        ("Reply All", SendMode::ReplyAll),
+        ("Forward", SendMode::Forward),
+    ] {
+        let id = message.id.clone();
+        page.append(&item(
+            label,
+            later(
+                state,
+                &popover,
+                Box::new(move |s| respond_to(s, session, &id, mode)),
+            ),
+        ));
+    }
+    page.append(&separator());
+
+    for (label, read) in [("Mark as Read", true), ("Mark as Unread", false)] {
+        let id = message.id.clone();
+        page.append(&item(
+            label,
+            later(
+                state,
+                &popover,
+                Box::new(move |s| set_read_state(s, session, &id, read)),
+            ),
+        ));
+    }
+    page.append(&separator());
+
+    // "Move" swaps the menu for the folder list, the way a submenu does.
+    let folders: Vec<Folder> = state
+        .sessions
+        .borrow()
+        .get(session)
+        .and_then(|s| s.db.folders().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f.id != message.folder_id)
+        .collect();
+    if !folders.is_empty() {
+        let pages_for_move = pages.clone();
+        page.append(&item(
+            "Move",
+            Box::new(move || pages_for_move.set_visible_child_name("move")),
+        ));
+    }
+    let id = message.id.clone();
+    page.append(&item(
+        "Archive",
+        later(state, &popover, Box::new(move |s| archive_message(s, session, &id))),
+    ));
+    page.append(&separator());
+    let id = message.id.clone();
+    page.append(&item(
+        "Delete",
+        later(state, &popover, Box::new(move |s| delete_message(s, session, &id))),
+    ));
+
+    pages.add_named(&page, Some("main"));
+
+    if !folders.is_empty() {
+        let move_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let back = item("← Move to", {
+            let pages = pages.clone();
+            Box::new(move || pages.set_visible_child_name("main"))
+        });
+        back.add_css_class("dim-label");
+        move_page.append(&back);
+        move_page.append(&separator());
+        for folder in folders {
+            let id = message.id.clone();
+            let folder_id = folder.id.clone();
+            let name = folder.display_name.clone();
+            move_page.append(&item(
+                &folder.display_name,
+                later(
+                    state,
+                    &popover,
+                    Box::new(move |s| {
+                        drop_message_into(s, session, &id, &folder_id, &name);
+                        reload_messages(s);
+                        reload_folders(s, false);
+                        render_status(s);
+                    }),
+                ),
+            ));
+        }
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&move_page)
+            .propagate_natural_height(true)
+            .max_content_height(420)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        pages.add_named(&scroll, Some("move"));
+    }
+
+    popover.set_child(Some(&pages));
+    // The popover belongs to the row while it is up; let go of it once it
+    // closes, or the row keeps a menu it will never show again.
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+}
+
 /// A row in the message list. A conversation of several messages gets a
 /// disclosure arrow that expands the thread in place, as Outlook does; a
 /// child row is one message of an expanded thread.
@@ -1493,6 +1654,18 @@ fn message_row(
         Some(gdk::ContentProvider::for_value(&payload.to_value()))
     });
     row.add_controller(source);
+
+    // Right-click acts on this row, whether or not it is the selected one.
+    let menu_gesture = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+    let menu_state = state.clone();
+    let menu_message = message.clone();
+    menu_gesture.connect_released(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Ok(row) = gesture.widget().downcast::<gtk::ListBoxRow>() {
+            show_row_menu(&menu_state, &row, session, &menu_message, x, y);
+        }
+    });
+    row.add_controller(menu_gesture);
 
     let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     row_box.add_css_class("message-row");
@@ -1995,6 +2168,19 @@ fn select_after_removal(state: &Rc<State>, position: usize) {
     }
 }
 
+/// Answer a particular message, rather than whatever is open.
+fn respond_to(state: &Rc<State>, session: usize, id: &str, mode: SendMode) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some(detail)) = db.message(id) else { return };
+    // The body is what gets quoted, so make sure it is on hand.
+    if detail.body.is_none() {
+        if let Some(open) = state.sessions.borrow().get(session) {
+            open.send(Cmd::OpenMessage(id.to_string()));
+        }
+    }
+    ComposeWindow::open(state, session, Some((detail, mode)));
+}
+
 fn respond(state: &Rc<State>, mode: SendMode) {
     if let Some(detail) = current_detail(state) {
         ComposeWindow::open(state, state.active_session(), Some((detail, mode)));
@@ -2031,49 +2217,40 @@ fn drop_message_into(
 }
 
 fn apply_op(state: &Rc<State>, op: Op) -> anyhow::Result<()> {
-    let index = state.active_session();
+    apply_op_in(state, state.active_session(), op)
+}
+
+fn apply_op_in(state: &Rc<State>, session: usize, op: Op) -> anyhow::Result<()> {
     let sessions = state.sessions.borrow();
-    match sessions.get(index) {
+    match sessions.get(session) {
         Some(session) => session.apply(op),
         None => Ok(()),
     }
 }
 
-fn delete_current(state: &Rc<State>) {
-    let Some(detail) = current_detail(state) else { return };
-    let db = state.sessions.borrow().get(state.active_session()).map(|s| s.db.clone());
-    let purge = match (db.as_ref().and_then(|db| db.folder_id_by_name("Deleted Items")), &detail) {
-        (Some(bin), detail) => detail.summary.folder_id == bin,
-        (None, _) => true,
-    };
-    let position = selected_position(state);
-    let removed = match apply_op(state, Op::Delete { message_id: detail.summary.id.clone(), purge })
-    {
-        Ok(()) => {
-            show_message(state, None);
-            toast(state, if purge { "Deleted" } else { "Moved to Deleted Items" });
-            true
-        }
-        Err(e) => {
-            toast(state, &e.to_string());
-            false
-        }
-    };
-    reload_messages(state);
-    reload_folders(state, false);
-    render_status(state);
-    if removed {
-        if let Some(position) = position {
-            select_after_removal(state, position);
-        }
+
+fn archive_current(state: &Rc<State>) {
+    if let Some(id) = state.current_message.borrow().clone() {
+        archive_message(state, state.active_session(), &id);
     }
 }
 
-fn archive_current(state: &Rc<State>) {
-    let Some(detail) = current_detail(state) else { return };
-    let Some(db) = state.sessions.borrow().get(state.active_session()).map(|s| s.db.clone()) else {
-        return;
-    };
+fn delete_current(state: &Rc<State>) {
+    if let Some(id) = state.current_message.borrow().clone() {
+        delete_message(state, state.active_session(), &id);
+    }
+}
+
+/// Whether a command is acting on the message the reading pane holds. If
+/// it is, the list moves on to the next one; a command aimed at some other
+/// row leaves the selection where it is.
+fn acting_on_open_message(state: &Rc<State>, session: usize, id: &str) -> bool {
+    session == state.active_session() && state.current_message.borrow().as_deref() == Some(id)
+}
+
+fn archive_message(state: &Rc<State>, session: usize, id: &str) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some(detail)) = db.message(id) else { return };
     let Some(archive) = db.folder_id_by_name("Archive") else {
         toast(state, "This mailbox has no Archive folder.");
         return;
@@ -2084,13 +2261,17 @@ fn archive_current(state: &Rc<State>) {
     }
     // Queued like any other change, so it reaches the server and survives
     // being made offline.
-    let position = selected_position(state);
-    let moved = match apply_op(
+    let open = acting_on_open_message(state, session, id);
+    let position = open.then(|| selected_position(state)).flatten();
+    let moved = match apply_op_in(
         state,
-        Op::Move { message_id: detail.summary.id.clone(), folder_id: archive },
+        session,
+        Op::Move { message_id: id.to_string(), folder_id: archive },
     ) {
         Ok(()) => {
-            show_message(state, None);
+            if open {
+                show_message(state, None);
+            }
             toast(state, "Moved to Archive");
             true
         }
@@ -2107,6 +2288,67 @@ fn archive_current(state: &Rc<State>) {
             select_after_removal(state, position);
         }
     }
+}
+
+fn delete_message(state: &Rc<State>, session: usize, id: &str) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some(detail)) = db.message(id) else { return };
+    // Deleting from the bin is what empties it; anywhere else it moves.
+    let purge = match db.folder_id_by_name("Deleted Items") {
+        Some(bin) => detail.summary.folder_id == bin,
+        None => true,
+    };
+    let open = acting_on_open_message(state, session, id);
+    let position = open.then(|| selected_position(state)).flatten();
+    let removed =
+        match apply_op_in(state, session, Op::Delete { message_id: id.to_string(), purge }) {
+            Ok(()) => {
+                if open {
+                    show_message(state, None);
+                }
+                toast(state, if purge { "Deleted" } else { "Moved to Deleted Items" });
+                true
+            }
+            Err(e) => {
+                toast(state, &e.to_string());
+                false
+            }
+        };
+    reload_messages(state);
+    reload_folders(state, false);
+    render_status(state);
+    if removed {
+        if let Some(position) = position {
+            select_after_removal(state, position);
+        }
+    }
+}
+
+/// Mark a row read or unread. A conversation row stands for its whole
+/// thread, so that is what changes — as it does in Outlook.
+fn set_read_state(state: &Rc<State>, session: usize, id: &str, is_read: bool) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some(detail)) = db.message(id) else { return };
+    let mut ids = vec![id.to_string()];
+    if state.threaded.get() {
+        if let Ok(thread) =
+            db.conversation_messages(&detail.summary.folder_id, &detail.summary.conversation_id)
+        {
+            ids = thread.into_iter().map(|m| m.summary.id).collect();
+        }
+    }
+    for message_id in ids {
+        if let Err(e) = apply_op_in(state, session, Op::MarkRead { message_id, is_read }) {
+            toast(state, &e.to_string());
+            return;
+        }
+    }
+    if acting_on_open_message(state, session, id) {
+        update_read_toggle(state, is_read);
+    }
+    reload_messages(state);
+    reload_folders(state, false);
+    render_status(state);
 }
 
 fn toggle_read_current(state: &Rc<State>) {
