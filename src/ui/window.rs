@@ -2259,13 +2259,17 @@ fn apply_op_in(state: &Rc<State>, session: usize, op: Op) -> anyhow::Result<()> 
 
 
 fn archive_current(state: &Rc<State>) {
-    if let Some(id) = state.current_message.borrow().clone() {
+    // Let go of the borrow before acting: filing the message clears the
+    // reading pane, which takes the same cell mutably.
+    let open = state.current_message.borrow().clone();
+    if let Some(id) = open {
         archive_message(state, state.active_session(), &id);
     }
 }
 
 fn delete_current(state: &Rc<State>) {
-    if let Some(id) = state.current_message.borrow().clone() {
+    let open = state.current_message.borrow().clone();
+    if let Some(id) = open {
         delete_message(state, state.active_session(), &id);
     }
 }
