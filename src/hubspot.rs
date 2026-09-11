@@ -658,6 +658,8 @@ impl crate::connector::Connector for TicketPipeline {
                         preview: crate::util::html_to_text(&t.content).chars().take(140).collect(),
                         is_read: true,
                         has_attachments: false,
+                        // A ticket's state lives in its stage, not in a verb.
+                        answered: crate::model::Answered::No,
                         pending: Pending::None,
                     }
                 })

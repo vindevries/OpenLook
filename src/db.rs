@@ -11,8 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::graph::folder_rank;
 use crate::model::{
-    Address, Attachment, Body, CalendarEvent, Folder, MessageDetail, MessagePatch, MessageSummary,
-    Op, Pending,
+    Address, Answered, Attachment, Body, CalendarEvent, Folder, MessageDetail, MessagePatch,
+    MessageSummary, Op, Pending,
 };
 use crate::util::now_unix;
 
@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS messages (
     preview         TEXT NOT NULL DEFAULT '',
     is_read         INTEGER NOT NULL DEFAULT 1,
     has_attachments INTEGER NOT NULL DEFAULT 0,
+    -- Exchange's "last verb executed": 102/103 replied, 104 forwarded.
+    answered        INTEGER NOT NULL DEFAULT 0,
     body_is_html    INTEGER,
     body            TEXT,
     pending         INTEGER NOT NULL DEFAULT 0
@@ -122,6 +124,10 @@ impl Db {
         // Folders cached before subfolders were fetched have no parent,
         // and the next folder sync fills them in.
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN parent_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN answered INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Adding the conversation column succeeds exactly once. Cached mail
         // predates it, so drop the delta cursors at the same moment and let
         // the next sync refill the rows with their thread.
@@ -284,7 +290,7 @@ impl Db {
         let like = format!("%{search}%");
         let sql = "SELECT id, folder_id, subject, from_name, from_addr, received, preview,
                           is_read, has_attachments, pending,
-                          COALESCE(NULLIF(conversation_id, ''), id)
+                          COALESCE(NULLIF(conversation_id, ''), id), answered
                      FROM messages WHERE folder_id = ?1"
             .to_string();
         let sql = if search.is_empty() {
@@ -310,6 +316,7 @@ impl Db {
                 pending: pending_from(r.get::<_, i64>(9)?),
                 conversation_id: r.get(10)?,
                 thread_count: 1,
+                answered: Answered::from_verb(r.get(11)?),
             })
         };
         let rows = if search.is_empty() {
@@ -341,7 +348,8 @@ impl Db {
         let sql = format!(
             "SELECT id, folder_id, subject, from_name, from_addr, MAX(received), preview,
                     MIN(is_read), MAX(has_attachments), MAX(pending),
-                    COALESCE(NULLIF(conversation_id, ''), id) AS cid, COUNT(*)
+                    COALESCE(NULLIF(conversation_id, ''), id) AS cid, COUNT(*),
+                    MAX(answered)
                FROM messages WHERE folder_id = ?1{filter}
               GROUP BY cid
               ORDER BY MAX(received) DESC"
@@ -360,6 +368,7 @@ impl Db {
                 pending: pending_from(r.get::<_, i64>(9)?),
                 conversation_id: r.get(10)?,
                 thread_count: r.get(11)?,
+                answered: Answered::from_verb(r.get(12)?),
             })
         };
         let rows = if search.is_empty() {
@@ -403,7 +412,7 @@ impl Db {
             .query_row(
                 "SELECT id, folder_id, subject, from_name, from_addr, received, preview,
                         is_read, has_attachments, pending, to_json, cc_json, body_is_html, body,
-                        COALESCE(NULLIF(conversation_id, ''), id)
+                        COALESCE(NULLIF(conversation_id, ''), id), answered
                    FROM messages WHERE id = ?1",
                 params![id],
                 |r| {
@@ -424,6 +433,7 @@ impl Db {
                             pending: pending_from(r.get::<_, i64>(9)?),
                             conversation_id: r.get(14)?,
                             thread_count: 1,
+                            answered: Answered::from_verb(r.get(15)?),
                         },
                         to: to_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
                         cc: cc_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
@@ -581,6 +591,21 @@ impl Db {
             )?,
             None => conn.execute("UPDATE messages SET pending = 2 WHERE id = ?1", params![id])?,
         };
+        Ok(())
+    }
+
+    /// Record which messages have been replied to or forwarded. Sent by
+    /// itself because the delta feed cannot carry it.
+    pub fn set_answered(&self, verbs: &[(String, i64)]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE messages SET answered = ?2 WHERE id = ?1")?;
+            for (id, verb) in verbs {
+                stmt.execute(params![id, verb])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

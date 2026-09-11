@@ -330,6 +330,7 @@ fn read_item(value: &Value) -> Option<MessageSummary> {
         preview: value["preview"].as_str().unwrap_or_default().to_string(),
         is_read: value["read"].as_bool().unwrap_or(true),
         has_attachments: value["has_attachments"].as_bool().unwrap_or(false),
+        answered: crate::model::Answered::No,
         pending: Pending::None,
     })
 }

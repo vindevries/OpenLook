@@ -84,7 +84,39 @@ pub struct MessageSummary {
     pub preview: String,
     pub is_read: bool,
     pub has_attachments: bool,
+    /// What was last done with this message: replied to, or forwarded.
+    pub answered: Answered,
     pub pending: Pending,
+}
+
+/// Whether a message has been answered, the way Outlook marks it in the
+/// list. Exchange records this as the "last verb executed" against the
+/// message — the reply or the forward is a separate message elsewhere, so
+/// this is the only trace of it on the one you are looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answered {
+    No,
+    Replied,
+    Forwarded,
+}
+
+impl Answered {
+    /// Exchange's own numbering: 102 reply, 103 reply-all, 104 forward.
+    pub fn from_verb(verb: i64) -> Self {
+        match verb {
+            102 | 103 => Answered::Replied,
+            104 => Answered::Forwarded,
+            _ => Answered::No,
+        }
+    }
+
+    pub fn verb(self) -> i64 {
+        match self {
+            Answered::No => 0,
+            Answered::Replied => 102,
+            Answered::Forwarded => 104,
+        }
+    }
 }
 
 impl MessageSummary {
@@ -102,6 +134,7 @@ impl MessageSummary {
             preview: String::new(),
             is_read: true,
             has_attachments: false,
+            answered: Answered::No,
             pending: Pending::None,
         }
     }

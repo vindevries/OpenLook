@@ -76,6 +76,10 @@ const CSS: &str = r#"
   font-size: 0.85em;
   opacity: 0.65;
 }
+/* What was last done with a message, in Outlook's own colours */
+.verb-replied { color: #8764B8; }
+.verb-forwarded { color: #0F6CBD; }
+
 .thread-arrow {
   min-width: 20px;
   min-height: 20px;

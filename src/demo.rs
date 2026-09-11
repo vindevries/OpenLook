@@ -245,6 +245,7 @@ pub fn seed(db: &Db) -> Result<()> {
             preview: html_to_text(&body_html).chars().take(140).collect(),
             is_read: !seed.unread,
             has_attachments: false,
+            answered: crate::model::Answered::No,
             pending: Pending::None,
         };
         let to: Vec<Address> = seed.to.iter().map(|(n, a)| Address::new(*n, *a)).collect();

@@ -17,7 +17,8 @@ use webkit::prelude::*;
 use crate::auth::Auth;
 use crate::config::Settings;
 use crate::model::{
-    AccountInfo, Attachment, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode, Status,
+    AccountInfo, Answered, Attachment, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode,
+    Status,
 };
 use crate::sync::{runtime, Cmd, Event, Mode, Session};
 use crate::ui::compose::ComposeWindow;
@@ -2016,6 +2017,23 @@ fn message_row(
         count.set_tooltip_text(Some("Messages in this conversation"));
         line.append(&count);
     }
+    // What was last done with it, as Outlook marks it: a purple arrow for
+    // answered, a blue one for passed on.
+    match message.answered {
+        Answered::Replied => {
+            let mark = gtk::Image::from_icon_name("mail-replied-symbolic");
+            mark.set_tooltip_text(Some("You replied to this message"));
+            mark.add_css_class("verb-replied");
+            line.append(&mark);
+        }
+        Answered::Forwarded => {
+            let mark = gtk::Image::from_icon_name("mail-forward-symbolic");
+            mark.set_tooltip_text(Some("You forwarded this message"));
+            mark.add_css_class("verb-forwarded");
+            line.append(&mark);
+        }
+        Answered::No => {}
+    }
     if message.has_attachments {
         line.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
     }
@@ -2827,6 +2845,7 @@ mod selection_tests {
             preview: String::new(),
             is_read: true,
             has_attachments: false,
+            answered: Answered::No,
             pending: Pending::None,
         })
     }

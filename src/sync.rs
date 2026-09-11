@@ -298,6 +298,7 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
                 preview: preview.chars().take(120).collect(),
                 is_read: true,
                 has_attachments: false,
+                answered: crate::model::Answered::No,
                 pending: Pending::Queued,
             };
             let to: Vec<_> = message.to.iter().map(crate::model::Address::bare).collect();
@@ -652,6 +653,13 @@ impl Engine {
                 }
                 if !announce.is_empty() {
                     self.emit(Event::NewMail(announce));
+                }
+                // The delta feed will not carry "replied" or "forwarded", so
+                // the folder's newest messages are asked about separately.
+                if let Ok(verbs) = graph.answered(folder_id, WINDOW).await {
+                    if self.db.set_answered(&verbs).is_ok() && !verbs.is_empty() {
+                        self.emit(Event::MessagesChanged(folder_id.to_string()));
+                    }
                 }
                 self.seen.insert(folder_id.to_string());
             }

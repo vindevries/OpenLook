@@ -26,6 +26,12 @@ const DELTA_PAGE_SIZE: u32 = 100;
 /// Bounded, a token arrives in one request and syncs are incremental from
 /// then on.
 const DELTA_WINDOW_DAYS: i64 = 30;
+/// Exchange's "last verb executed" — what marks a message as replied to or
+/// forwarded. Delta queries refuse to expand it, so it is fetched
+/// alongside the plain listings, which do allow it.
+const VERB_EXPAND: &str =
+    "$expand=singleValueExtendedProperties($filter=id%20eq%20'Integer%200x1081')";
+
 const SUMMARY_FIELDS: &str =
     "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,parentFolderId,conversationId";
 
@@ -259,7 +265,8 @@ impl Graph {
     /// fallback whenever a delta token is rejected.
     pub async fn messages_window(&self, folder_id: &str, top: u32) -> GraphResult<Vec<MessageSummary>> {
         let url = format!(
-            "/me/mailFolders/{}/messages?$top={top}&$orderby=receivedDateTime desc&$select={SUMMARY_FIELDS}",
+            "/me/mailFolders/{}/messages?$top={top}&$orderby=receivedDateTime desc\
+             &$select={SUMMARY_FIELDS}&{VERB_EXPAND}",
             urlencoding::encode(folder_id)
         );
         let data = self.get(&url).await?;
@@ -302,6 +309,26 @@ impl Graph {
             }
         }
         Ok(out)
+    }
+
+    /// Which of a folder's newest messages have been replied to or
+    /// forwarded. A separate listing because the delta feed the sync runs
+    /// on will not carry the property, and the list would otherwise never
+    /// show what has already been dealt with.
+    pub async fn answered(&self, folder_id: &str, top: u32) -> GraphResult<Vec<(String, i64)>> {
+        let url = format!(
+            "/me/mailFolders/{}/messages?$top={top}&$orderby=receivedDateTime desc\
+             &$select=id&{VERB_EXPAND}",
+            urlencoding::encode(folder_id)
+        );
+        let data = self.get(&url).await?;
+        Ok(data["value"]
+            .as_array()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| Some((m["id"].as_str()?.to_string(), parse_verb(m))))
+            .collect())
     }
 
     /// Fetch changes for a folder. Pass the stored cursor to resume: either
@@ -754,6 +781,19 @@ fn parse_summary(m: &Value, folder_id: &str) -> MessageSummary {
         preview: html_to_text(preview),
         is_read: m["isRead"].as_bool().unwrap_or(true),
         has_attachments: m["hasAttachments"].as_bool().unwrap_or(false),
+        answered: crate::model::Answered::from_verb(parse_verb(m)),
         pending: Pending::None,
     }
+}
+
+/// The verb out of an expanded property list, if it came back at all.
+fn parse_verb(m: &Value) -> i64 {
+    m["singleValueExtendedProperties"]
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find_map(|p| p["value"].as_str())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
