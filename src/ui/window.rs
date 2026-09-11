@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use webkit::prelude::*;
 
 use crate::auth::Auth;
+use crate::config::Settings;
 use crate::model::{
     AccountInfo, Attachment, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode, Status,
 };
@@ -886,6 +887,21 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         state.window.add_action(&action);
     }
 
+    // Clicking a new-mail notification raises the window on that message.
+    let show_mail = gio::SimpleAction::new(
+        "show-mail",
+        Some(&glib::VariantTy::new("(us)").expect("valid variant type")),
+    );
+    let s = state.clone();
+    show_mail.connect_activate(move |_, parameter| {
+        let Some((session, id)) = parameter.and_then(|p| p.get::<(u32, String)>()) else {
+            return;
+        };
+        s.window.present();
+        reveal_message(&s, session as usize, &id);
+    });
+    app.add_action(&show_mail);
+
     app.set_accels_for_action("win.new-mail", &["<Control>n"]);
     app.set_accels_for_action("win.refresh", &["F5", "<Control>r"]);
     app.set_accels_for_action("win.reply", &["<Control><Shift>r"]);
@@ -988,6 +1004,7 @@ pub fn listen(state: &Rc<State>, index: usize) {
                         }
                     }
                 }
+                Event::NewMail(arrivals) => announce_new_mail(&state, index, &arrivals),
                 Event::AttachmentsChanged(id) => {
                     let showing = state.current_message.borrow().as_deref() == Some(id.as_str());
                     if showing {
@@ -1473,6 +1490,47 @@ fn drag_payload(session: usize, message_id: &str) -> String {
 fn parse_drag_payload(payload: &str) -> Option<(usize, &str)> {
     let (session, id) = payload.split_once('\n')?;
     Some((session.parse().ok()?, id))
+}
+
+/// Tell the desktop that mail has arrived. One notification per mailbox,
+/// replaced rather than stacked, so a busy inbox does not bury the screen.
+fn announce_new_mail(state: &Rc<State>, session: usize, arrivals: &[MessageSummary]) {
+    if arrivals.is_empty() || !Settings::load().notify_new_mail() {
+        return;
+    }
+    let Some(app) = state.window.application() else { return };
+    let mailbox = state
+        .sessions
+        .borrow()
+        .get(session)
+        .map(|s| s.mode.label())
+        .unwrap_or_else(|| "Mail".into());
+
+    let notification = gio::Notification::new(&match arrivals {
+        [one] => format!("{} — {mailbox}", one.from.display()),
+        many => format!("{} new messages — {mailbox}", many.len()),
+    });
+    let body = match arrivals {
+        [one] => one.subject.clone(),
+        many => many
+            .iter()
+            .take(4)
+            .map(|m| format!("{} — {}", m.from.display(), m.subject))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    notification.set_body(Some(&body));
+    notification.set_icon(&gio::ThemedIcon::new("mail-unread-symbolic"));
+    // Clicking it brings the window up on that message.
+    if let Some(first) = arrivals.first() {
+        notification.set_default_action_and_target_value(
+            "app.show-mail",
+            Some(&(session as u32, first.id.as_str()).to_variant()),
+        );
+    }
+    // One id per mailbox: a second batch replaces the first rather than
+    // piling up.
+    app.send_notification(Some(&format!("new-mail-{session}")), &notification);
 }
 
 /// Outlook's right-click menu, with the commands this client can carry
@@ -2191,6 +2249,34 @@ fn select_after_removal(state: &Rc<State>, position: usize) {
     let index = {
         let entries = state.entries.borrow();
         next_selection(&entries, position)
+    };
+    if let Some(row) = index.and_then(|i| state.message_list.row_at_index(i as i32)) {
+        state.message_list.select_row(Some(&row));
+    }
+}
+
+/// Show a message wherever it lives: switch to its mailbox and folder if
+/// need be, then select its row so the reading pane opens it.
+fn reveal_message(state: &Rc<State>, session: usize, id: &str) {
+    let Some(db) = state.sessions.borrow().get(session).map(|s| s.db.clone()) else { return };
+    let Ok(Some(detail)) = db.message(id) else { return };
+    set_scope(state, Scope::Mail);
+    let folder = detail.summary.folder_id.clone();
+    if state.current.borrow().as_ref() != Some(&(session, folder.clone())) {
+        *state.current.borrow_mut() = Some((session, folder));
+        reload_folders(state, false);
+        reload_messages(state);
+    }
+    // The row may be the conversation the message belongs to.
+    let index = {
+        let entries = state.entries.borrow();
+        entries.iter().position(|entry| match entry {
+            ListEntry::Message(m) => m.id == id,
+            ListEntry::Conversation(m) => {
+                m.id == id || m.conversation_id == detail.summary.conversation_id
+            }
+            ListEntry::DateHeader => false,
+        })
     };
     if let Some(row) = index.and_then(|i| state.message_list.row_at_index(i as i32)) {
         state.message_list.select_row(Some(&row));

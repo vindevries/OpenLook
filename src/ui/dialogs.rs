@@ -355,6 +355,20 @@ pub fn show_settings(state: &Rc<State>) {
     group.add(tenant_row.row());
     page.add(&group);
 
+    let alerts_group = adw::PreferencesGroup::builder()
+        .title("New mail")
+        .description("A desktop alert when mail arrives in an inbox, as Outlook shows.")
+        .build();
+    let notify_row = adw::ActionRow::builder().title("Announce new mail").build();
+    let notify_switch = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
+        .active(settings.notify_new_mail())
+        .build();
+    notify_row.add_suffix(&notify_switch);
+    notify_row.set_activatable_widget(Some(&notify_switch));
+    alerts_group.add(&notify_row);
+    page.add(&alerts_group);
+
     let cache_group = adw::PreferencesGroup::builder()
         .title("Offline")
         .description("Mail is cached on this computer so it can be read without a network.")
@@ -369,6 +383,7 @@ pub fn show_settings(state: &Rc<State>) {
 
     dialog.connect_close_request(move |_| {
         let mut settings = Settings::load();
+        settings.notify_mail = Some(notify_switch.is_active());
         settings.client_id = client_id_row.text().trim().to_string();
         if settings.client_id.is_empty() {
             settings.client_id = DEFAULT_CLIENT_ID.to_string();

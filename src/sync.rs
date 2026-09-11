@@ -147,6 +147,8 @@ pub enum Event {
     FoldersChanged,
     MessagesChanged(String),
     BodyReady(String),
+    /// Mail that has just landed in the Inbox, for the desktop to announce.
+    NewMail(Vec<MessageSummary>),
     /// The list of files a message carries has arrived.
     AttachmentsChanged(String),
     /// An attachment is on disk at this path, ready to be opened.
@@ -198,6 +200,7 @@ impl Session {
             last_folder: None,
             label: mode.label(),
             key: mode.key(),
+            seen: std::collections::HashSet::new(),
         };
         runtime().spawn(engine.run(cmd_rx));
         Ok(Session { db, mode, cmd_tx, events })
@@ -323,6 +326,9 @@ struct Engine {
     label: String,
     /// Filesystem-safe name for this mailbox, for its downloads.
     key: String,
+    /// Folders this run has already been through. The first pass over a
+    /// folder is the cache catching up, not mail arriving, so it is quiet.
+    seen: std::collections::HashSet<String>,
 }
 
 impl Engine {
@@ -669,6 +675,20 @@ impl Engine {
                     }
                 }
                 let changed = !upserts.is_empty() || !patches.is_empty() || !removed.is_empty();
+                // Arrivals, before the cache is written: mail the cache has
+                // not seen, still unread, in the folder mail arrives in.
+                let announce: Vec<MessageSummary> = if self.seen.contains(folder_id)
+                    && self.db.folder_id_by_name("Inbox").as_deref() == Some(folder_id)
+                {
+                    upserts
+                        .iter()
+                        .filter(|m| !m.is_read)
+                        .filter(|m| matches!(self.db.message(&m.id), Ok(None)))
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let _ = self.db.upsert_messages(&upserts);
                 let _ = self.db.patch_messages(&patches);
                 for id in &removed {
@@ -684,6 +704,10 @@ impl Engine {
                 if changed {
                     self.emit(Event::MessagesChanged(folder_id.to_string()));
                 }
+                if !announce.is_empty() {
+                    self.emit(Event::NewMail(announce));
+                }
+                self.seen.insert(folder_id.to_string());
             }
             Err(e) if e.is_offline() => return,
             Err(_) => {

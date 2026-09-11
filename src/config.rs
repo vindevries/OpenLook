@@ -33,6 +33,9 @@ pub struct Settings {
     /// Group the message list by conversation. Defaults to on.
     #[serde(default)]
     pub thread_view: Option<bool>,
+    /// Announce new mail on the desktop. Defaults to on.
+    #[serde(default)]
+    pub notify_mail: Option<bool>,
     /// Widths of the folder pane and the message list, in pixels. Zero
     /// means "not set yet", so the defaults apply.
     #[serde(default)]
@@ -53,6 +56,7 @@ impl Default for Settings {
             tenant: DEFAULT_TENANT.into(),
             demo_ack: false,
             thread_view: None,
+            notify_mail: None,
             pane_folders: 0,
             pane_list: 0,
             hubspot_pipelines: Vec::new(),
@@ -64,6 +68,11 @@ impl Settings {
     /// Conversations are grouped unless the user has turned it off.
     pub fn threaded(&self) -> bool {
         self.thread_view.unwrap_or(true)
+    }
+
+    /// New mail is announced unless the user has turned it off.
+    pub fn notify_new_mail(&self) -> bool {
+        self.notify_mail.unwrap_or(true)
     }
 
     pub fn load() -> Settings {
