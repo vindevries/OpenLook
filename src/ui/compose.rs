@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::model::{MessageDetail, Op, Outgoing, SendMode};
+use crate::util::{fmt_full_time, quoted_original};
 use crate::ui::widgets::{EntryRow, ToolbarView};
 use crate::ui::window::{self, State};
 
@@ -13,6 +14,15 @@ pub struct ComposeWindow;
 
 impl ComposeWindow {
     /// `respond_to` carries the message being answered and how.
+    fn quote_source(detail: &MessageDetail) -> String {
+        match &detail.body {
+            Some(body) if body.is_html => crate::util::html_to_text(&body.content),
+            Some(body) => body.content.clone(),
+            // Not downloaded — the preview is all the cache holds.
+            None => detail.summary.preview.clone(),
+        }
+    }
+
     pub fn open(
         state: &Rc<State>,
         session_index: usize,
@@ -102,6 +112,33 @@ impl ComposeWindow {
             .left_margin(8)
             .right_margin(8)
             .build();
+        // Quote what is being answered or passed on, the way Outlook does,
+        // so it can be read and trimmed before it goes out.
+        if let Some(original) = &original {
+            if !matches!(mode, SendMode::New) {
+                let names = |list: &[crate::model::Address]| {
+                    list.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", ")
+                };
+                let text = quoted_original(
+                    matches!(mode, SendMode::Forward),
+                    &format!(
+                        "{} <{}>",
+                        original.summary.from.display(),
+                        original.summary.from.address
+                    ),
+                    &fmt_full_time(&original.summary.received),
+                    &names(&original.to),
+                    &names(&original.cc),
+                    &original.summary.subject,
+                    &Self::quote_source(original),
+                );
+                let buffer = body_view.buffer();
+                buffer.set_text(&text);
+                // Start where the reply gets typed, above the quote.
+                buffer.place_cursor(&buffer.start_iter());
+            }
+        }
+
         let body_scroll = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
         content.append(&gtk::Frame::builder().child(&body_scroll).build());
 

@@ -33,6 +33,10 @@ const SUMMARY_FIELDS: &str =
 const FOLDER_ORDER: [&str; 7] =
     ["Inbox", "Drafts", "Sent Items", "Outbox", "Deleted Items", "Junk Email", "Archive"];
 
+fn addresses(list: &[String]) -> Vec<Value> {
+    list.iter().map(|a| json!({ "emailAddress": { "address": a } })).collect()
+}
+
 pub fn folder_rank(display_name: &str) -> i64 {
     FOLDER_ORDER.iter().position(|n| *n == display_name).map(|i| i as i64).unwrap_or(100)
 }
@@ -551,37 +555,45 @@ impl Graph {
         self.move_message(id, "deleteditems").await
     }
 
+    /// Ask the server for a draft reply or forward. It comes back holding
+    /// the original message — and, for a forward, its attachments — which
+    /// is what carries them through to the recipient.
+    async fn response_draft(&self, original: &str, mode: SendMode) -> GraphResult<String> {
+        let action = match mode {
+            SendMode::Reply => "createReply",
+            SendMode::ReplyAll => "createReplyAll",
+            SendMode::Forward => "createForward",
+            SendMode::New => return Err(GraphError::Permanent("Not a response".into())),
+        };
+        let url = format!("{GRAPH}/me/messages/{}/{action}", urlencoding::encode(original));
+        let draft = self
+            .send(self.http.post(url).json(&json!({})))
+            .await?
+            .ok_or_else(|| GraphError::Transient("Empty response".into()))?;
+        draft["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| GraphError::Permanent("The server returned no draft to send".into()))
+    }
+
     pub async fn send_mail(&self, msg: &Outgoing) -> GraphResult<()> {
         if let Some(original) = &msg.in_reply_to {
-            let id = urlencoding::encode(original);
-            let comment = msg.body.replace('\n', "<br>");
-            match msg.mode {
-                SendMode::Reply => {
-                    let url = format!("{GRAPH}/me/messages/{id}/reply");
-                    self.send(self.http.post(url).json(&json!({ "comment": comment }))).await?;
-                    return Ok(());
-                }
-                SendMode::ReplyAll => {
-                    let url = format!("{GRAPH}/me/messages/{id}/replyAll");
-                    self.send(self.http.post(url).json(&json!({ "comment": comment }))).await?;
-                    return Ok(());
-                }
-                SendMode::Forward => {
-                    let url = format!("{GRAPH}/me/messages/{id}/forward");
-                    let recipients: Vec<_> = msg
-                        .to
-                        .iter()
-                        .map(|a| json!({ "emailAddress": { "address": a } }))
-                        .collect();
-                    self.send(
-                        self.http
-                            .post(url)
-                            .json(&json!({ "comment": comment, "toRecipients": recipients })),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                SendMode::New => {}
+            if !matches!(msg.mode, SendMode::New) {
+                // The composer already shows the original quoted beneath
+                // what was typed, so the whole body goes out as written —
+                // asking the server to quote it again would repeat it.
+                let draft = self.response_draft(original, msg.mode).await?;
+                let id = urlencoding::encode(&draft);
+                let url = format!("{GRAPH}/me/messages/{id}");
+                self.send(self.http.patch(url).json(&json!({
+                    "body": { "contentType": "HTML", "content": crate::util::text_as_html(&msg.body) },
+                    "toRecipients": addresses(&msg.to),
+                    "ccRecipients": addresses(&msg.cc),
+                })))
+                .await?;
+                let url = format!("{GRAPH}/me/messages/{id}/send");
+                self.send(self.http.post(url)).await?;
+                return Ok(());
             }
         }
         let url = format!("{GRAPH}/me/sendMail");
@@ -590,8 +602,8 @@ impl Graph {
             "message": {
                 "subject": msg.subject,
                 "body": { "contentType": "Text", "content": msg.body },
-                "toRecipients": msg.to.iter().map(|a| json!({"emailAddress": {"address": a}})).collect::<Vec<_>>(),
-                "ccRecipients": msg.cc.iter().map(|a| json!({"emailAddress": {"address": a}})).collect::<Vec<_>>(),
+                "toRecipients": addresses(&msg.to),
+                "ccRecipients": addresses(&msg.cc),
             }
         });
         self.send(self.http.post(url).json(&payload)).await?;

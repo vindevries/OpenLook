@@ -209,6 +209,50 @@ pub fn cid_references(html: &str) -> std::collections::HashSet<String> {
 ///
 /// Content ids appear in mail both bare and wrapped in angle brackets, and
 /// the reference in the HTML may be either form, so both are matched.
+/// The original message, quoted the way Outlook quotes it in a reply or
+/// a forward, so what is on screen is what the recipient will read.
+pub fn quoted_original(
+    forwarded: bool,
+    from: &str,
+    sent: &str,
+    to: &str,
+    cc: &str,
+    subject: &str,
+    body: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(if forwarded {
+        "\n\n---------- Forwarded message ----------\n"
+    } else {
+        "\n\n________________________________\n"
+    });
+    out.push_str(&format!("From: {from}\n"));
+    if !sent.is_empty() {
+        out.push_str(&format!("Sent: {sent}\n"));
+    }
+    if !to.is_empty() {
+        out.push_str(&format!("To: {to}\n"));
+    }
+    if !cc.is_empty() {
+        out.push_str(&format!("Cc: {cc}\n"));
+    }
+    out.push_str(&format!("Subject: {subject}\n\n"));
+    out.push_str(body.trim_end());
+    out.push('\n');
+    out
+}
+
+/// Typed text as a mail body. Plain text, so it is escaped rather than
+/// interpreted, and its line breaks are kept by the layout rather than by
+/// sprinkling tags through it.
+pub fn text_as_html(text: &str) -> String {
+    format!(
+        "<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:11pt;\
+         white-space:pre-wrap\">{}</div>",
+        escape_html(text)
+    )
+}
+
 /// A short, stable, filesystem-safe stand-in for a long opaque id.
 /// Graph attachment ids are hundreds of characters, which makes an ugly
 /// directory name and can overrun path limits; this keeps them apart
@@ -313,5 +357,52 @@ mod cid_tests {
     fn an_image_that_was_not_fetched_is_left_alone() {
         let html = r#"<img src="cid:missing@example">"#;
         assert_eq!(inline_cid_images(html, &[image()]), html);
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn a_forward_carries_the_original_and_says_who_sent_it() {
+        let quote = quoted_original(
+            true,
+            "Mark de Jong <mark@fabrikam.nl>",
+            "Thursday 10 September 2026, 09:10",
+            "Vincent de Vries",
+            "",
+            "Licence renewal",
+            "Procurement approved the renewal.",
+        );
+        assert!(quote.contains("Forwarded message"));
+        assert!(quote.contains("From: Mark de Jong <mark@fabrikam.nl>"));
+        assert!(quote.contains("Subject: Licence renewal"));
+        assert!(quote.contains("Procurement approved the renewal."));
+        // Room to type above it, as in Outlook.
+        assert!(quote.starts_with("\n\n"));
+        // Nothing to say about a Cc nobody was on.
+        assert!(!quote.contains("Cc:"));
+    }
+
+    #[test]
+    fn a_reply_quotes_without_calling_itself_a_forward() {
+        let quote = quoted_original(false, "A <a@b.c>", "", "", "", "Hello", "Body");
+        assert!(!quote.contains("Forwarded"));
+        assert!(quote.contains("From: A <a@b.c>"));
+        // An unknown date is left out rather than shown blank.
+        assert!(!quote.contains("Sent:"));
+    }
+
+    /// What is typed is mail, not markup: a body mentioning a tag must
+    /// arrive as that text rather than as an element.
+    #[test]
+    fn typed_text_is_escaped_not_interpreted() {
+        let html = text_as_html("use <b> for bold\nsecond line");
+        assert!(html.contains("&lt;b&gt;"));
+        assert!(!html.contains("<b>"));
+        // Line breaks survive without tags sprinkled through the text.
+        assert!(html.contains("second line"));
+        assert!(html.contains("pre-wrap"));
     }
 }
