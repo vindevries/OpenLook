@@ -16,7 +16,9 @@ webkit = { package = "webkit6", version = "0.3", optional = true }
 glib = "0.19"
 gio = "0.19"
 
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+# "process" and "io-util" are what talking to a plugin over its standard
+# input and output needs; see src/plugin.rs.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "process", "io-util", "io-std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
 async-channel = "2"
 

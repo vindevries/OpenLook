@@ -208,18 +208,16 @@ pub fn build(app: &adw::Application) {
             Err(e) => eprintln!("openlook: cannot open cache for {}: {e}", account.username),
         }
     }
-    // HubSpot ticket pipelines sit alongside the mailboxes, each as its
-    // own section, and only when a token has been provided.
-    if crate::config::hubspot_token().is_some() {
-        for pipeline in crate::config::Settings::load().hubspot_pipelines {
-            let mode = Mode::Tickets {
-                pipeline_id: pipeline.id.clone(),
-                pipeline_label: pipeline.label.clone(),
-            };
-            match Session::new(mode, auth.clone(), http.clone()) {
-                Ok(session) => sessions.push(session),
-                Err(e) => eprintln!("openlook: cannot open cache for {}: {e}", pipeline.label),
-            }
+    // Connectors sit alongside the mailboxes, each as its own section.
+    for connector in crate::config::Settings::load().connectors {
+        let mode = Mode::Connector {
+            plugin: connector.plugin.clone(),
+            scope: connector.scope.clone(),
+            label: connector.label.clone(),
+        };
+        match Session::new(mode, auth.clone(), http.clone()) {
+            Ok(session) => sessions.push(session),
+            Err(e) => eprintln!("openlook: cannot open cache for {}: {e}", connector.label),
         }
     }
 
@@ -870,7 +868,7 @@ fn connect_signals(state: &Rc<State>, app: &adw::Application) {
         ("toggle-read", Box::new(toggle_read_current)),
         ("sign-in", Box::new(|s: &Rc<State>| match s.scope() {
             // In the ticket pane, "add" means connecting HubSpot.
-            Scope::Tickets => dialogs::show_hubspot_dialog(s),
+            Scope::Tickets => dialogs::show_connector_dialog(s),
             Scope::Mail => dialogs::show_account_dialog(s, false),
         })),
         ("sign-out", Box::new(dialogs::sign_out)),
@@ -2684,18 +2682,19 @@ pub fn add_account(state: &Rc<State>, account: AccountInfo) {
     toast(state, &format!("Added {username}"));
 }
 
-/// Open sessions for the ticket pipelines just chosen, replacing any that
-/// are already open so re-adding does not duplicate them.
-pub fn add_ticket_pipelines(state: &Rc<State>, pipelines: &[crate::config::PipelineRef]) {
+/// Open sessions for the connectors just chosen, replacing any that are
+/// already open so re-adding does not duplicate them.
+pub fn add_connectors(state: &Rc<State>, connectors: &[crate::config::ConnectorRef]) {
     state.sessions.borrow_mut().retain(|s| !s.is_tickets());
     let keep = state.sessions.borrow().len();
     state.statuses.borrow_mut().truncate(keep);
     *state.ticket_selection.borrow_mut() = None;
 
-    for pipeline in pipelines {
-        let mode = Mode::Tickets {
-            pipeline_id: pipeline.id.clone(),
-            pipeline_label: pipeline.label.clone(),
+    for connector in connectors {
+        let mode = Mode::Connector {
+            plugin: connector.plugin.clone(),
+            scope: connector.scope.clone(),
+            label: connector.label.clone(),
         };
         match Session::new(mode, state.auth.clone(), state.http.clone()) {
             Ok(session) => {
@@ -2707,12 +2706,13 @@ pub fn add_ticket_pipelines(state: &Rc<State>, pipelines: &[crate::config::Pipel
                     session.send(Cmd::SyncAll(None));
                 }
             }
-            Err(e) => toast(state, &format!("Could not open {}: {e}", pipeline.label)),
+            Err(e) => toast(state, &format!("Could not open {}: {e}", connector.label)),
         }
     }
     set_scope(state, Scope::Tickets);
     reload_folders(state, true);
-    toast(state, &format!("Added {} ticket pipeline(s)", pipelines.len()));
+    let count = connectors.len();
+    toast(state, &format!("Added {count} section{}", if count == 1 { "" } else { "s" }));
 }
 
 /// Drop the mailbox whose folder is currently selected.

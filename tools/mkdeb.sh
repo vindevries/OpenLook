@@ -7,6 +7,7 @@
 # The package installs:
 #   /usr/bin/openlook
 #   /usr/share/applications/com.opslogix.Openlook.desktop
+#   /usr/bin/openlook-hubspot  plus its manifest under /usr/share/openlook/plugins
 #   /usr/share/icons/hicolor/scalable/apps/openlook.svg
 #
 # For a native build the runtime dependencies are computed from the binary
@@ -66,6 +67,10 @@ install -Dm755 "$BUILT"                        "$PKG/usr/bin/openlook"
 # and drops those it cannot match to an installed application.
 install -Dm644 "$SRC/data/com.opslogix.Openlook.desktop" \
     "$PKG/usr/share/applications/com.opslogix.Openlook.desktop"
+# Connectors: the program, and the manifest that tells OpenLook about it.
+install -Dm755 "$(dirname "$BUILT")/openlook-hubspot" "$PKG/usr/bin/openlook-hubspot"
+install -Dm644 "$SRC/data/plugins/hubspot/plugin.json" \
+    "$PKG/usr/share/openlook/plugins/hubspot/plugin.json"
 install -Dm644 "$SRC/data/openlook.svg"        "$PKG/usr/share/icons/hicolor/scalable/apps/openlook.svg"
 install -Dm644 "$SRC/LICENSE"                  "$PKG/usr/share/doc/openlook/copyright"
 install -Dm644 "$SRC/README.md"                "$PKG/usr/share/doc/openlook/README.md"

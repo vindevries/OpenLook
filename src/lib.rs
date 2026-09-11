@@ -14,6 +14,7 @@ pub mod demo;
 pub mod graph;
 pub mod hubspot;
 pub mod model;
+pub mod plugin;
 pub mod sync;
 pub mod ui;
 pub mod util;

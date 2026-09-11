@@ -1,0 +1,10 @@
+{
+  "id": "hubspot",
+  "name": "HubSpot",
+  "items_called": "tickets",
+  "exec": ["openlook-hubspot"],
+  "credential": {
+    "label": "Private app key",
+    "help": "In HubSpot: Settings → Integrations → Private Apps, with the scopes tickets, crm.objects.contacts.read and conversations.read."
+  }
+}

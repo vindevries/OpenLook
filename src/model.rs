@@ -85,6 +85,26 @@ pub struct MessageSummary {
     pub pending: Pending,
 }
 
+impl MessageSummary {
+    /// A row with nothing filled in, for callers that have only a couple
+    /// of fields and no use for the rest.
+    pub fn empty() -> Self {
+        Self {
+            id: String::new(),
+            folder_id: String::new(),
+            conversation_id: String::new(),
+            thread_count: 1,
+            subject: String::new(),
+            from: Address::new("", ""),
+            received: String::new(),
+            preview: String::new(),
+            is_read: true,
+            has_attachments: false,
+            pending: Pending::None,
+        }
+    }
+}
+
 /// The properties one delta entry actually carried. Once Graph has reported
 /// a message, later entries for it hold only what changed — an `isRead` and
 /// little else — so anything absent here has to be left as the cache already

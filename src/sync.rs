@@ -17,7 +17,6 @@ use crate::config::{account_key, db_path};
 use crate::connector::Connector;
 use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
-use crate::hubspot::HubSpot;
 use crate::model::{AccountInfo, Address, Body, Folder, MessageSummary, Op, Pending, Status};
 use crate::util::{now_unix, safe_name, short_key};
 
@@ -99,8 +98,9 @@ async fn fetch_body(
 pub enum Mode {
     Demo,
     Account(AccountInfo),
-    /// A HubSpot ticket pipeline, shown as its own section of folders.
-    Tickets { pipeline_id: String, pipeline_label: String },
+    /// One connector — a plugin and the part of it to show — as its own
+    /// section of folders.
+    Connector { plugin: String, scope: String, label: String },
 }
 
 impl Mode {
@@ -108,7 +108,9 @@ impl Mode {
         match self {
             Mode::Demo => "demo".into(),
             Mode::Account(a) => account_key(&a.username),
-            Mode::Tickets { pipeline_id, .. } => format!("hubspot-{pipeline_id}"),
+            // The cache is named for the plugin and what it is showing,
+            // which is what keeps two queues of the same plugin apart.
+            Mode::Connector { plugin, scope, .. } => format!("{plugin}-{scope}"),
         }
     }
 
@@ -118,7 +120,10 @@ impl Mode {
             Mode::Demo => "demo mailbox".into(),
             Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
             Mode::Account(a) => a.name.clone(),
-            Mode::Tickets { pipeline_label, .. } => format!("HubSpot · {pipeline_label}"),
+            Mode::Connector { plugin, label, .. } => {
+                let name = crate::plugin::manifest(plugin).map(|m| m.name).unwrap_or_else(|| plugin.clone());
+                format!("{name} · {label}")
+            }
         }
     }
 }
@@ -183,15 +188,18 @@ impl Session {
             Mode::Account(account) => {
                 Backend::Mail(Graph::new(http, auth, account.username.clone()))
             }
-            Mode::Tickets { pipeline_id, .. } => match crate::config::hubspot_token() {
-                Some(token) => Backend::Items(Arc::new(crate::hubspot::TicketPipeline::new(
-                    HubSpot::new(http, token),
-                    pipeline_id.clone(),
-                ))),
-                // Without a token there is nothing to sync; the cache still
-                // serves whatever was fetched before.
-                None => Backend::Demo,
-            },
+            Mode::Connector { plugin, scope, .. } => {
+                match crate::plugin::manifest(plugin) {
+                    Some(manifest) => Backend::Items(Arc::new(crate::plugin::Plugin::new(
+                        manifest,
+                        crate::config::credential(plugin).unwrap_or_default(),
+                        scope.clone(),
+                    ))),
+                    // The plugin is not installed any more; the cache still
+                    // serves whatever it fetched before.
+                    None => Backend::Demo,
+                }
+            }
         };
         let engine = Engine {
             db: db.clone(),
@@ -218,14 +226,14 @@ impl Session {
     pub fn account(&self) -> Option<&AccountInfo> {
         match &self.mode {
             Mode::Account(a) => Some(a),
-            Mode::Demo | Mode::Tickets { .. } => None,
+            Mode::Demo | Mode::Connector { .. } => None,
         }
     }
 
     /// Ticket sessions have no mailbox behind them, so mail-only actions
     /// (archive, reply-as-mail) do not apply.
     pub fn is_tickets(&self) -> bool {
-        matches!(self.mode, Mode::Tickets { .. })
+        matches!(self.mode, Mode::Connector { .. })
     }
 
     /// Label for this mailbox in the folder pane.
@@ -234,7 +242,7 @@ impl Session {
             Mode::Account(a) if !a.username.is_empty() => a.username.clone(),
             Mode::Account(a) => a.name.clone(),
             Mode::Demo => "Demo mailbox".to_string(),
-            Mode::Tickets { pipeline_label, .. } => pipeline_label.clone(),
+            Mode::Connector { label, .. } => label.clone(),
         }
     }
 
