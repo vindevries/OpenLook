@@ -16,6 +16,24 @@ use crate::model::{
 };
 use crate::util::now_unix;
 
+/// How the `pending` column reads. Zero has always meant "in sync"; one,
+/// "waiting to go out".
+fn pending_from(stored: i64) -> Pending {
+    match stored {
+        0 => Pending::None,
+        2 => Pending::Failed,
+        _ => Pending::Queued,
+    }
+}
+
+fn pending_value(pending: Pending) -> i64 {
+    match pending {
+        Pending::None => 0,
+        Pending::Queued => 1,
+        Pending::Failed => 2,
+    }
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS folders (
     id           TEXT PRIMARY KEY,
@@ -129,6 +147,17 @@ impl Db {
             let _ = conn
                 .execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('inline_images', '1')", []);
         }
+        // A message waiting to be sent whose outbox entry is gone is not
+        // waiting for anything — it failed in a run that could not say so.
+        let _ = conn.execute(
+            "UPDATE messages
+                SET pending = 2,
+                    folder_id = COALESCE(
+                        (SELECT id FROM folders WHERE display_name = 'Drafts'), folder_id)
+              WHERE pending = 1
+                AND id NOT IN (SELECT message_id FROM outbox WHERE message_id IS NOT NULL)",
+            [],
+        );
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -270,7 +299,7 @@ impl Db {
                 preview: r.get(6)?,
                 is_read: r.get::<_, i64>(7)? != 0,
                 has_attachments: r.get::<_, i64>(8)? != 0,
-                pending: if r.get::<_, i64>(9)? != 0 { Pending::Queued } else { Pending::None },
+                pending: pending_from(r.get::<_, i64>(9)?),
                 conversation_id: r.get(10)?,
                 thread_count: 1,
             })
@@ -320,7 +349,7 @@ impl Db {
                 preview: r.get(6)?,
                 is_read: r.get::<_, i64>(7)? != 0,
                 has_attachments: r.get::<_, i64>(8)? != 0,
-                pending: if r.get::<_, i64>(9)? != 0 { Pending::Queued } else { Pending::None },
+                pending: pending_from(r.get::<_, i64>(9)?),
                 conversation_id: r.get(10)?,
                 thread_count: r.get(11)?,
             })
@@ -384,11 +413,7 @@ impl Db {
                             preview: r.get(6)?,
                             is_read: r.get::<_, i64>(7)? != 0,
                             has_attachments: r.get::<_, i64>(8)? != 0,
-                            pending: if r.get::<_, i64>(9)? != 0 {
-                                Pending::Queued
-                            } else {
-                                Pending::None
-                            },
+                            pending: pending_from(r.get::<_, i64>(9)?),
                             conversation_id: r.get(14)?,
                             thread_count: 1,
                         },
@@ -533,6 +558,21 @@ impl Db {
                 conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
             }
         }
+        Ok(())
+    }
+
+    /// A locally-composed message the server refused. It stays readable
+    /// rather than vanishing, in Drafts where an unsent message belongs.
+    pub fn mark_send_failed(&self, id: &str) -> Result<()> {
+        let drafts = self.folder_id_by_name("Drafts");
+        let conn = self.conn();
+        match drafts {
+            Some(drafts) => conn.execute(
+                "UPDATE messages SET pending = 2, folder_id = ?2 WHERE id = ?1",
+                params![id, drafts],
+            )?,
+            None => conn.execute("UPDATE messages SET pending = 2 WHERE id = ?1", params![id])?,
+        };
         Ok(())
     }
 
@@ -750,7 +790,7 @@ impl Db {
                 serde_json::to_string(cc)?,
                 body.is_html as i64,
                 body.content,
-                matches!(summary.pending, Pending::Queued) as i64,
+                pending_value(summary.pending),
                 summary.conversation_id,
             ],
         )?;

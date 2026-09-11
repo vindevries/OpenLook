@@ -46,6 +46,9 @@ pub enum Pending {
     None,
     /// Composed locally, still waiting to be sent.
     Queued,
+    /// The server refused it outright. It is not going anywhere on its
+    /// own, so it says so rather than claiming to be on its way.
+    Failed,
 }
 
 /// A file carried by a message. The bytes are downloaded only when

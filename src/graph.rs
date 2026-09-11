@@ -619,7 +619,10 @@ impl Graph {
                 })))
                 .await?;
                 let url = format!("{GRAPH}/me/messages/{id}/send");
-                self.send(self.http.post(url)).await?;
+                // Nothing to send in the body, but Graph still insists on a
+                // length: without one it answers 411 and the mail stays put.
+                self.send(self.http.post(url).header(reqwest::header::CONTENT_LENGTH, "0"))
+                    .await?;
                 return Ok(());
             }
         }

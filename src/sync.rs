@@ -952,7 +952,12 @@ impl Engine {
                 }
                 Err(e) => {
                     let _ = self.db.dequeue(row_id);
-                    if matches!(op, Op::Send { .. }) {
+                    if let Op::Send { local_id, .. } = &op {
+                        // Keep what was written: it moves to Drafts, marked
+                        // as refused, rather than sitting in Sent Items
+                        // claiming to be on its way.
+                        let _ = self.db.mark_send_failed(local_id);
+                        self.emit(Event::MessagesChanged(String::new()));
                         self.emit(Event::Failed(format!("Message not sent: {e}")));
                     }
                 }

@@ -1536,10 +1536,17 @@ fn message_row(
         .build();
     sender.add_css_class("m-sender");
     line.append(&sender);
-    if matches!(message.pending, Pending::Queued) {
-        let chip = gtk::Label::new(Some("Queued"));
-        chip.add_css_class("queued-chip");
-        line.append(&chip);
+    match message.pending {
+        Pending::Queued | Pending::Failed => {
+            let failed = matches!(message.pending, Pending::Failed);
+            let chip = gtk::Label::new(Some(if failed { "Not sent" } else { "Queued" }));
+            chip.add_css_class("queued-chip");
+            if failed {
+                chip.add_css_class("error");
+            }
+            line.append(&chip);
+        }
+        Pending::None => {}
     }
     if message.thread_count > 1 {
         let count = gtk::Label::new(Some(&message.thread_count.to_string()));
@@ -1816,10 +1823,18 @@ fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     state.to_label.set_text(&format!("To: {recipients}"));
     state.date_label.set_text(&fmt_full_time(&detail.summary.received));
 
-    let queued = matches!(detail.summary.pending, Pending::Queued);
-    state.pending_label.set_visible(queued);
-    if queued {
-        state.pending_label.set_text("Waiting to send — will go out when you're online");
+    match detail.summary.pending {
+        Pending::Queued => {
+            state.pending_label.set_visible(true);
+            state.pending_label.set_text("Waiting to send — will go out when you're online");
+        }
+        Pending::Failed => {
+            state.pending_label.set_visible(true);
+            state
+                .pending_label
+                .set_text("Not sent — the server refused it. Forward or reply again to retry.");
+        }
+        Pending::None => state.pending_label.set_visible(false),
     }
 
     update_read_toggle(state, detail.summary.is_read);
