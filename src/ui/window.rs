@@ -2194,7 +2194,7 @@ fn render_attachments(state: &Rc<State>, summary: &MessageSummary) {
     state.attachment_bar.set_visible(true);
 }
 
-fn attachment_icon(content_type: &str) -> &'static str {
+pub fn attachment_icon(content_type: &str) -> &'static str {
     match content_type {
         t if t.starts_with("image/") => "image-x-generic-symbolic",
         t if t.starts_with("audio/") => "audio-x-generic-symbolic",
@@ -2212,7 +2212,7 @@ fn attachment_icon(content_type: &str) -> &'static str {
     }
 }
 
-fn fmt_size(bytes: i64) -> String {
+pub fn fmt_size(bytes: i64) -> String {
     match bytes {
         b if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
         b if b >= 1024 => format!("{} KB", b / 1024),
@@ -2222,7 +2222,7 @@ fn fmt_size(bytes: i64) -> String {
 
 /// Open an attachment with whatever the desktop uses for its type,
 /// downloading it first if this is the first time it has been opened.
-fn open_attachment(state: &Rc<State>, message_id: &str, attachment_id: &str) {
+pub fn open_attachment(state: &Rc<State>, message_id: &str, attachment_id: &str) {
     let session_index = state.active_session();
     let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
     if let Some(path) = db

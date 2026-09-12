@@ -36,6 +36,80 @@ impl ComposeWindow {
         format!("{header}{body}")
     }
 
+    /// The files that travel with a forward. The server builds the
+    /// forward from the original, so they are carried whether or not they
+    /// are listed here; listing them is how the sender knows that.
+    fn attachment_row(
+        state: &Rc<State>,
+        session_index: usize,
+        original: &MessageDetail,
+    ) -> Option<gtk::Widget> {
+        if !original.summary.has_attachments {
+            return None;
+        }
+        let db = state.sessions.borrow().get(session_index).map(|s| s.db.clone())?;
+        let items: Vec<crate::model::Attachment> = db
+            .attachments(&original.summary.id)
+            .unwrap_or_default()
+            .into_iter()
+            // Pictures the message draws are part of it, not files sent
+            // alongside, and the forward carries them inside its body.
+            .filter(|item| !item.is_inline)
+            .collect();
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let caption = gtk::Label::builder().label("Attached").valign(gtk::Align::Start).build();
+        caption.add_css_class("dim-label");
+        caption.add_css_class("caption");
+        caption.set_margin_top(6);
+        row.append(&caption);
+
+        if items.is_empty() {
+            // The list has not been cached yet — ask for it, so the next
+            // window shows the files themselves rather than this line.
+            if let Some(session) = state.sessions.borrow().get(session_index) {
+                session.send(crate::sync::Cmd::ListAttachments(original.summary.id.clone()));
+            }
+            let note = gtk::Label::builder()
+                .label("The original's attachments go with it")
+                .xalign(0.0)
+                .build();
+            note.add_css_class("dim-label");
+            note.add_css_class("caption");
+            note.set_margin_top(6);
+            row.append(&note);
+            return Some(row.upcast());
+        }
+
+        let chips = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .column_spacing(6)
+            .row_spacing(6)
+            .hexpand(true)
+            .build();
+        for item in items {
+            let button = gtk::Button::builder()
+                .tooltip_text(format!("Open {}", item.name))
+                .child(
+                    &adw::ButtonContent::builder()
+                        .icon_name(window::attachment_icon(&item.content_type))
+                        .label(&format!("{}  ({})", item.name, window::fmt_size(item.size)))
+                        .build(),
+                )
+                .build();
+            button.add_css_class("attachment-chip");
+            let state = state.clone();
+            let message_id = original.summary.id.clone();
+            let attachment_id = item.id.clone();
+            button.connect_clicked(move |_| {
+                window::open_attachment(&state, &message_id, &attachment_id);
+            });
+            chips.insert(&button, -1);
+        }
+        row.append(&chips);
+        Some(row.upcast())
+    }
+
     /// Hand a finished message to the mailbox, and close the window if it
     /// was taken.
     fn deliver(
@@ -157,6 +231,17 @@ impl ComposeWindow {
         fields.append(cc_row.row());
         fields.append(subject_row.row());
         content.append(&fields);
+
+        // A forward carries the original's files with it. Show them, so it
+        // is clear what is going out — and so they can be opened and
+        // checked before it does.
+        if let Some(original) = &original {
+            if matches!(mode, SendMode::Forward) {
+                if let Some(row) = Self::attachment_row(state, session_index, original) {
+                    content.append(&row);
+                }
+            }
+        }
 
         // One box holding the whole message — what is written at the top,
         // the original beneath its header — all of it editable, and all of

@@ -639,20 +639,34 @@ impl Graph {
     /// as well would show the recipient a pile of image001.png.
     async fn drop_inline_attachments(&self, draft: &str) {
         let id = urlencoding::encode(draft);
-        let Ok(list) = self.get(&format!("/me/messages/{id}/attachments?$select=id,isInline")).await
-        else {
-            return;
-        };
-        for item in list["value"].as_array().map(|v| v.as_slice()).unwrap_or_default() {
-            if item["isInline"].as_bool() != Some(true) {
-                continue;
-            }
-            let Some(attachment) = item["id"].as_str() else { continue };
+        // Deleting an attachment renumbers the ones after it, so ids read
+        // in one listing go stale as soon as the first delete lands — and
+        // a stale id names whichever attachment moved into that place,
+        // which is how the file being forwarded used to get deleted along
+        // with the pictures. Take them one at a time, looking again after
+        // each, and stop if a delete does not stick.
+        loop {
+            let Ok(list) =
+                self.get(&format!("/me/messages/{id}/attachments?$select=id,isInline")).await
+            else {
+                return;
+            };
+            let next = list["value"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .find(|item| item["isInline"].as_bool() == Some(true))
+                .and_then(|item| item["id"].as_str())
+                .map(str::to_string);
+            let Some(attachment) = next else { return };
             let url = format!(
                 "{GRAPH}/me/messages/{id}/attachments/{}",
-                urlencoding::encode(attachment)
+                urlencoding::encode(&attachment)
             );
-            let _ = self.send(self.http.delete(url)).await;
+            if self.send(self.http.delete(url)).await.is_err() {
+                return;
+            }
         }
     }
 
