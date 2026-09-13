@@ -171,6 +171,11 @@ pub struct State {
     unread_only: Cell<bool>,
     newest_first: Cell<bool>,
     rebuilding: Cell<bool>,
+    /// A redraw is already waiting to happen, so further reports of change
+    /// join it rather than each costing a rebuild of their own.
+    refresh_queued: Cell<bool>,
+    /// That redraw has to rebuild the message list, not just the counts.
+    refresh_messages: Cell<bool>,
 }
 
 impl State {
@@ -680,6 +685,8 @@ pub fn build(app: &adw::Application) {
         unread_only: Cell::new(false),
         newest_first: Cell::new(true),
         rebuilding: Cell::new(false),
+        refresh_queued: Cell::new(false),
+        refresh_messages: Cell::new(false),
     });
 
     {
@@ -983,10 +990,8 @@ pub fn listen(state: &Rc<State>, index: usize) {
             match event {
                 Event::FoldersChanged => reload_folders(&state, false),
                 Event::MessagesChanged(folder) => {
-                    if state.current.borrow().as_ref() == Some(&(index, folder.clone())) {
-                        reload_messages(&state);
-                    }
-                    reload_folders(&state, false);
+                    let showing = state.current.borrow().as_ref() == Some(&(index, folder));
+                    schedule_refresh(&state, showing);
                 }
                 Event::BodyReady(id) => {
                     let in_thread = state.current_thread.borrow().iter().any(|m| m == &id);
@@ -2463,6 +2468,87 @@ fn selected_position(state: &Rc<State>) -> Option<usize> {
     state.message_list.selected_row().map(|row| row.index() as usize)
 }
 
+/// Redraw after the server has changed something, once, shortly.
+///
+/// A sync reports folder after folder, and a first enumeration reports the
+/// same folder many times over. Rebuilding on each report puts seconds of
+/// work on the thread that is also handling clicks — mail filed during a
+/// sync appeared to hang for several seconds — while the user only ever
+/// sees the last of them.
+fn schedule_refresh(state: &Rc<State>, with_messages: bool) {
+    if with_messages {
+        state.refresh_messages.set(true);
+    }
+    if state.refresh_queued.replace(true) {
+        return;
+    }
+    let state = state.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+        state.refresh_queued.set(false);
+        if state.refresh_messages.replace(false) {
+            reload_messages(&state);
+        }
+        reload_folders(&state, false);
+        render_status(&state);
+    });
+}
+
+/// Take one row out of the list, along with the date header it leaves
+/// empty. Rebuilding the folder instead would re-create every row in it —
+/// nine hundred widgets in a real inbox — for a click that removes one,
+/// and the wait is what makes filing mail feel slow.
+fn remove_row(state: &Rc<State>, position: usize) {
+    state.rebuilding.set(true);
+    if let Some(row) = state.message_list.row_at_index(position as i32) {
+        state.message_list.remove(&row);
+    }
+    state.entries.borrow_mut().remove(position);
+    // The header above it is left standing if that was the last message
+    // of its day.
+    let header_above = position > 0
+        && matches!(state.entries.borrow().get(position - 1), Some(ListEntry::DateHeader));
+    let day_now_empty = !matches!(
+        state.entries.borrow().get(position),
+        Some(ListEntry::Message(_)) | Some(ListEntry::Conversation(_))
+    );
+    if header_above && day_now_empty {
+        if let Some(row) = state.message_list.row_at_index((position - 1) as i32) {
+            state.message_list.remove(&row);
+        }
+        state.entries.borrow_mut().remove(position - 1);
+    }
+    state.rebuilding.set(false);
+}
+
+/// A message has been filed: close the gap it left and land on the next
+/// one. The row goes as soon as the click does; the counts and anything
+/// the server has to say follow with the next sync.
+fn filed(state: &Rc<State>, position: Option<usize>) {
+    let Some(position) = position else {
+        // Filed from somewhere other than the open message — the list it
+        // sits in still has to be brought up to date.
+        reload_messages(state);
+        reload_folders(state, false);
+        render_status(state);
+        return;
+    };
+    // A conversation row stands for several messages, and filing one of
+    // them leaves the rest: that row has to be rebuilt, not removed.
+    let whole_row = match state.entries.borrow().get(position) {
+        Some(ListEntry::Message(_)) => true,
+        Some(ListEntry::Conversation(m)) => m.thread_count <= 1,
+        _ => false,
+    };
+    if whole_row {
+        remove_row(state, position);
+    } else {
+        reload_messages(state);
+    }
+    reload_folders(state, false);
+    render_status(state);
+    select_after_removal(state, position);
+}
+
 /// Select the row that took the place of the one that left, as if the
 /// user had clicked it, so the reading pane opens it.
 fn select_after_removal(state: &Rc<State>, position: usize) {
@@ -2619,14 +2705,7 @@ fn archive_message(state: &Rc<State>, session: usize, id: &str) {
             false
         }
     };
-    reload_messages(state);
-    reload_folders(state, false);
-    render_status(state);
-    if moved {
-        if let Some(position) = position {
-            select_after_removal(state, position);
-        }
-    }
+    filed(state, moved.then_some(position).flatten());
 }
 
 fn delete_message(state: &Rc<State>, session: usize, id: &str) {
@@ -2653,14 +2732,7 @@ fn delete_message(state: &Rc<State>, session: usize, id: &str) {
                 false
             }
         };
-    reload_messages(state);
-    reload_folders(state, false);
-    render_status(state);
-    if removed {
-        if let Some(position) = position {
-            select_after_removal(state, position);
-        }
-    }
+    filed(state, removed.then_some(position).flatten());
 }
 
 /// Mark a row read or unread. A conversation row stands for its whole
