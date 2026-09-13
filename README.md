@@ -12,9 +12,8 @@ Graph API and keeps a local copy so mail is readable **offline**.
 - Classic Outlook three-pane layout: folder pane, message list, reading pane,
   with draggable dividers whose widths are remembered, a ribbon-style
   command bar and a status bar
-- **HubSpot tickets** in their own pane beside Mail and Calendar: pipeline
-  stages as folders, tickets as rows, and a ticket's threads assembled in
-  the reading pane
+- **Folder tree**: folders inside folders, expanded from the pane, each
+  remembering where it sits
 - **Several mailboxes at once** — each gets its own section in the folder
   pane, its own cache and its own sync, with a shared Favorites section on top
 - Message list grouped by date (Today / Yesterday / weekday / Last Week), an
@@ -23,8 +22,24 @@ Graph API and keeps a local copy so mail is readable **offline**.
   with an arrow that expands it in place into its individual messages;
   opening the row reads the whole exchange in order; delete, archive and
   mark-read act on the conversation. Toggle it off to see single messages
-- Reading pane with contact initials, Reply, Reply all and Forward
+- Reading pane with contact initials, Reply, Reply all and Forward, and a
+  mark on the messages that have already been replied to or forwarded
+- **Attachments**: what a message carries is listed under its header and
+  opens with whatever the desktop uses for that kind of file. The bytes are
+  fetched on the first open and kept, so an attachment opened once opens
+  again with no network. Pictures the message draws are shown in the body
+  rather than listed as files
+- **Compose in the message itself**: a reply or forward opens with the
+  original quoted beneath the cursor, exactly as it will be sent. A forward
+  keeps the original's own formatting — pictures, tables, layout — and
+  carries its attachments along
+- Right-click a message for what to do with it; archiving or deleting the
+  open message lands on the next one down, the way Outlook does
 - Drag a message onto a folder to move it (within the same mailbox)
+- **Connectors**: a pane beside Mail and Calendar for things that are not
+  mail but read like it — a helpdesk queue, an issue tracker. Each connector
+  is a separate program OpenLook talks to; a HubSpot tickets plugin ships
+  with it (see [Connectors](#connectors))
 - **Calendar**: a month view switched from the rail on the left, merging
   every mailbox's events (colour-coded), with a day panel showing times,
   location and organiser; double-click an appointment to open it. Cached
@@ -38,6 +53,8 @@ Graph API and keeps a local copy so mail is readable **offline**.
   bounded to a recent window so a token arrives in one request, after which
   each poll is a single cheap call; local edits are never clobbered by a
   stale sync
+- **A desktop notice when mail arrives**, which goes by itself; turn it off
+  in Settings
 - Read HTML mail (WebKitGTK, JavaScript disabled; links open in your browser)
 - Compose, send, reply; mark read/unread; delete; per-folder search
 - **Demo mailbox** out of the box, so the whole UI works before you sign in
@@ -75,7 +92,8 @@ cargo test                # offline-behaviour tests (no display needed)
 ```
 
 `install.sh` sources the shim automatically when the `-dev` packages are
-missing.
+missing. The `.deb` also installs the HubSpot plugin (`openlook-hubspot`)
+and its manifest under `/usr/share/openlook/plugins`.
 
 ## Signing in
 
@@ -106,6 +124,40 @@ its client ID under **Advanced** in the sign-in dialog, or in Settings:
    `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read` (grant admin consent if
    required).
 
+## Connectors
+
+The third pane on the rail is for sources that are not mail but read like it:
+something with sections to list, items in them, and a body to read. Nothing
+about any particular service is compiled into OpenLook — a connector is a
+**plugin**, a separate program OpenLook starts and talks to over its standard
+input and output, one JSON object per line. A plugin can be written in any
+language, updated on its own, and a crash or a hang in it costs a pane rather
+than the mail client.
+
+Open the pane and press **Add mailbox…** to pick an installed plugin, give it
+whatever it needs to connect, and choose which of its queues to show as
+folders. Items are cached and read offline exactly like mail.
+
+Plugins are looked for in, nearest first:
+
+```
+~/.config/openlook/plugins/       your own
+/usr/share/openlook/plugins/      installed by a package
+/usr/local/share/openlook/plugins/
+```
+
+The credential a plugin was set up with is kept outside `settings.json`, in
+`~/.config/openlook/plugins/<id>/credential` (0600).
+
+Each is a directory holding the program and a `plugin.json` naming it —
+`data/plugins/hubspot/plugin.json` is the one that ships. A plugin sitting
+beside the running binary is found too, which is what makes one usable
+straight from a build directory.
+
+`src/bin/openlook-hubspot.rs` is the bundled example: HubSpot tickets, in a
+little over a hundred lines. The protocol it answers is documented at the top
+of `src/plugin.rs`.
+
 ## How offline works
 
 The UI never talks to the network. It reads only from the local database,
@@ -119,13 +171,17 @@ and a background engine reconciles that database with the server:
 - **Reading**: folders, message lists and prefetched bodies come from
   `~/.local/share/openlook/<account>.db`. With no network you still see
   everything that has been synced; a message whose body was never downloaded
-  says so instead of failing.
+  says so instead of failing. Attachments already opened once are kept under
+  `~/.local/share/openlook/attachments/`.
 - **Writing**: every change is applied to the cache immediately, then queued
   in an `outbox` table. The engine drains that queue whenever it can reach
   the server, and retries what it can't. A message composed offline appears
   in Sent Items marked *Queued* until it goes out.
 - **Safety**: messages with queued changes are skipped when a sync would
   otherwise overwrite them, so a sync in flight can't undo what you just did.
+- **Nothing waits on the network**: filing a message takes its row out of the
+  list at once, and the reports a sync makes gather into one redraw, so the
+  window keeps answering clicks while a mailbox is enumerating.
 - The header bar shows the state: *Syncing…*, *Offline — showing cached
   mail*, *N waiting to sync*, or *Updated 5 min ago*.
 
@@ -138,15 +194,22 @@ src/
   sync.rs       background engine: delta sync, body prefetch, queue replay
   graph.rs      Microsoft Graph client, with errors classified for retry
   auth.rs       device-code OAuth + token cache
+  connector.rs  what a source other than mail has to provide
+  plugin.rs     connectors living outside the app, over stdin/stdout
+  hubspot.rs    HubSpot REST client, used by the plugin
   demo.rs       demo mailbox seeded into the cache
-  ui/           window, compose, dialogs
+  ui/           window, compose, calendar, dialogs
+  bin/openlook-hubspot.rs   the HubSpot plugin
 tests/offline.rs  offline behaviour tests
 tools/dev-shim.sh build without the GTK -dev packages
+tools/mkdeb.sh    package a .deb, optionally for Ubuntu 22.04
 ```
 
 ## Roadmap
 
+- Attaching files to a message you write (a forward already carries the
+  original's)
+- Formatting toolbar for the message you write (a forward keeps the
+  original's formatting)
 - Creating and editing appointments (the calendar is read-only today)
-- Attachments (view/save/send)
 - Full-text search across folders (the cache makes this cheap)
-- New-mail desktop notifications
