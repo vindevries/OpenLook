@@ -12,9 +12,11 @@
 #
 # For a native build the runtime dependencies are computed from the binary
 # with dpkg-shlibdeps. For --target jammy the binary is linked against the
-# sysroot fetched by tools/jammy-sysroot.sh and the dependencies are the
+# sysroot fetched by tools/jammy-sysroot.sh and the GTK dependencies are the
 # versions that sysroot pinned, since dpkg-shlibdeps would otherwise report
-# this host's (newer) package names.
+# this host's (newer) package names. The libc6 floor is never pinned by hand:
+# it is read back out of the binary, and a build needing more than the target
+# can offer is rejected rather than packaged.
 set -euo pipefail
 
 TARGET=native
@@ -30,9 +32,12 @@ VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$SRC/Cargo.toml" | head -1)"
 ARCH="$(dpkg --print-architecture)"
 MAINTAINER="${DEBFULLNAME:-Vincent de Vries} <${DEBEMAIL:-vincent@opslogix.com}>"
 
-for t in dpkg-deb dpkg-shlibdeps; do
-  command -v "$t" >/dev/null || { echo "$t not found — sudo apt install dpkg-dev" >&2; exit 1; }
-done
+command -v dpkg-deb >/dev/null || { echo "dpkg-deb not found — sudo apt install dpkg" >&2; exit 1; }
+command -v objdump  >/dev/null || { echo "objdump not found — sudo apt install binutils" >&2; exit 1; }
+# Only the native branch computes its dependencies with dpkg-shlibdeps.
+if [ "$TARGET" = native ] && ! command -v dpkg-shlibdeps >/dev/null; then
+  echo "dpkg-shlibdeps not found — sudo apt install dpkg-dev" >&2; exit 1
+fi
 
 # rustup installs here but only adds it to interactive shells' PATH.
 [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -58,6 +63,54 @@ fi
 echo "Building (release, target: $TARGET)…"
 cargo build --release --manifest-path "$SRC/Cargo.toml"
 
+# ---- glibc floor ----------------------------------------------------------
+# tools/jammy-sysroot.sh redirects only the GTK stack; the C runtime still
+# comes from this host. Building on a newer machine therefore yields a binary
+# that asks libc for symbols the target does not have, and it dies in the
+# dynamic linker at startup — after installing cleanly, because the dependency
+# below used to be a guess rather than a measurement. Measure it instead.
+case "$TARGET" in
+  jammy) MAX_GLIBC=2.35 ;;  # Ubuntu 22.04 ships glibc 2.35
+  *)     MAX_GLIBC="$(ldd --version | sed -n '1s/.*[^0-9.]\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')" ;;
+esac
+
+# Imported symbols only: objdump prints those as "*UND* ... (GLIBC_2.39) name",
+# parentheses and all, which is the set that has to exist on the target.
+_glibc_refs() {  # binary -> "version symbol" per line
+  { objdump -T "$1" 2>/dev/null \
+      | grep -F '*UND*' \
+      | grep -oE '\(GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?\)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
+      | sed 's/^(GLIBC_//; s/)//' | tr -s '[:blank:]' ' '; } || true
+}
+
+# "$ver <= $MAX_GLIBC" the way sort -V orders them.
+_within() { [ "$(printf '%s\n%s\n' "$1" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ]; }
+
+BINARIES="$BUILT $(dirname "$BUILT")/openlook-hubspot"
+NEED_GLIBC=2.17
+TOO_NEW=""
+for b in $BINARIES; do
+  while read -r ver sym; do
+    [ -n "$ver" ] || continue
+    _within "$ver" || TOO_NEW="$TOO_NEW  $(basename "$b"): $sym needs glibc $ver"$'\n'
+    NEED_GLIBC="$(printf '%s\n%s\n' "$NEED_GLIBC" "$ver" | sort -V | tail -1)"
+  done <<EOF
+$(_glibc_refs "$b")
+EOF
+done
+
+if [ -n "$TOO_NEW" ]; then
+  echo >&2
+  echo "Refusing to package: the build needs a newer glibc than the target has." >&2
+  echo "  target ($TARGET) provides: glibc $MAX_GLIBC" >&2
+  printf '%s' "$TOO_NEW" >&2
+  echo >&2
+  echo "This host's glibc is $(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$'), and the sysroot does not cover libc." >&2
+  echo "Build the package on a $TARGET machine, or in a $TARGET container." >&2
+  exit 1
+fi
+echo "glibc floor: needs $NEED_GLIBC, target provides $MAX_GLIBC — ok"
+
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 PKG="$STAGE/pkg"
@@ -78,7 +131,8 @@ install -Dm644 "$SRC/README.md"                "$PKG/usr/share/doc/openlook/READ
 if [ "$TARGET" = jammy ]; then
   # The versions the sysroot linked against; libwebkitgtk-6.0-4 only reaches
   # jammy through jammy-updates/-security, hence the version floor.
-  DEPENDS="libc6 (>= 2.34), libgcc-s1 (>= 4.2), libglib2.0-0 (>= 2.72.0), \
+  # libc6 comes from the measurement above; the rest are what the sysroot pinned.
+  DEPENDS="libc6 (>= $NEED_GLIBC), libgcc-s1 (>= 4.2), libglib2.0-0 (>= 2.72.0), \
 libgtk-4-1 (>= 4.6.0), libadwaita-1-0 (>= 1.1.0), libpango-1.0-0 (>= 1.50.0), \
 libwebkitgtk-6.0-4 (>= 2.44.0)"
   DEPENDS="$(echo "$DEPENDS" | tr -s ' ')"
