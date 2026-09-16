@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build OpenLook and install it for the current user (no root needed):
 #   - binary       -> ~/.local/bin/openlook
-#   - desktop file -> ~/.local/share/applications/openlook.desktop
+#   - desktop file -> ~/.local/share/applications/com.opslogix.Openlook.desktop
 #   - icon         -> ~/.local/share/icons/hicolor/scalable/apps/openlook.svg
 #
 # Cached mail lives in ~/.local/share/openlook/ and settings in
@@ -32,7 +32,14 @@ cargo build --release --manifest-path "$SRC/Cargo.toml"
 
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
 install -m 755 "$SRC/target/release/openlook" "$BIN_DIR/openlook"
-install -m 644 "$SRC/data/openlook.desktop" "$APPS_DIR/openlook.desktop"
+# Named for the application id, as in tools/mkdeb.sh: the desktop matches
+# notifications to an installed application by it, and drops the ones it
+# cannot place.
+install -m 644 "$SRC/data/com.opslogix.Openlook.desktop" \
+    "$APPS_DIR/com.opslogix.Openlook.desktop"
+# Earlier versions installed it under the plain name; leaving that behind
+# would show OpenLook twice in the overview.
+rm -f "$APPS_DIR/openlook.desktop"
 install -m 644 "$SRC/data/openlook.svg" "$ICON_DIR/openlook.svg"
 
 # Clean up the payload of the previous Python build, if it is still around.
