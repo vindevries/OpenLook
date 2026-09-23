@@ -16,6 +16,7 @@ use webkit::prelude::*;
 
 use crate::auth::Auth;
 use crate::config::Settings;
+use crate::invite::{Invite, Method, Response};
 use crate::model::{
     AccountInfo, Answered, Attachment, Folder, MessageDetail, MessageSummary, Op, Pending, SendMode,
     Status,
@@ -122,6 +123,8 @@ pub struct State {
     to_label: gtk::Label,
     date_label: gtk::Label,
     pending_label: gtk::Label,
+    /// The invitation the open message carries, when it carries one.
+    invite_bar: gtk::Box,
     /// One button per file the open message carries.
     attachment_bar: gtk::FlowBox,
     read_toggle: gtk::Button,
@@ -501,6 +504,17 @@ pub fn build(app: &adw::Application) {
     pending_label.add_css_class("queued-chip");
     head.append(&pending_label);
 
+    // An invitation sits above the files: it is the point of the message
+    // carrying it, and the .ics itself is not something to open by hand.
+    let invite_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(10)
+        .visible(false)
+        .build();
+    invite_bar.add_css_class("invite-card");
+    head.append(&invite_bar);
+
     let attachment_bar = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .column_spacing(6)
@@ -649,6 +663,7 @@ pub fn build(app: &adw::Application) {
         to_label,
         date_label,
         pending_label,
+        invite_bar,
         attachment_bar,
         read_toggle,
         filter_unread,
@@ -1023,6 +1038,18 @@ pub fn listen(state: &Rc<State>, index: usize) {
                     if showing {
                         let db = state.sessions.borrow().get(index).map(|s| s.db.clone());
                         if let Some(Ok(Some(detail))) = db.map(|db| db.message(&id)) {
+                            render_attachments(&state, &detail.summary);
+                        }
+                    }
+                }
+                Event::InviteChanged(id) => {
+                    let showing = state.current_message.borrow().as_deref() == Some(id.as_str());
+                    if showing {
+                        let db = state.sessions.borrow().get(index).map(|s| s.db.clone());
+                        if let Some(Ok(Some(detail))) = db.map(|db| db.message(&id)) {
+                            render_invite(&state, &detail.summary);
+                            // The .ics behind the card is no longer a file
+                            // to offer separately.
                             render_attachments(&state, &detail.summary);
                         }
                     }
@@ -2147,6 +2174,186 @@ fn show_conversation(state: &Rc<State>, thread: &[MessageDetail]) {
     render_thread(state, thread);
 }
 
+/// Show the invitation an open message carries, with the answers that can
+/// actually be given to it.
+///
+/// Exchange can RSVP for a meeting it holds, which covers an invitation
+/// from Outlook and, usually, one from Google. Anything it did not
+/// recognise arrives as a plain message with an `.ics` on it; there is no
+/// meeting on the server to answer, so the one useful thing is to put the
+/// appointment on the calendar, and that is all this offers.
+fn render_invite(state: &Rc<State>, summary: &MessageSummary) {
+    while let Some(child) = state.invite_bar.first_child() {
+        state.invite_bar.remove(&child);
+    }
+    state.invite_bar.set_visible(false);
+    state.invite_bar.remove_css_class("invite-cancelled");
+
+    let session_index = state.active_session();
+    let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
+    let Some((invite, answered)) = db.invite(&summary.id) else {
+        // Mail cached before invitations were read carries none in the
+        // cache, and its body is already downloaded, so nothing else would
+        // look. Ask once; the card appears if the answer is yes.
+        if summary.has_attachments {
+            if let Some(session) = state.sessions.borrow().get(session_index) {
+                session.send(Cmd::EnsureInvite(summary.id.clone()));
+            }
+        }
+        return;
+    };
+    // Someone else's RSVP is a message to read, not an invitation to answer.
+    if invite.method == Method::Reply {
+        return;
+    }
+
+    let heading = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    heading.add_css_class("heading");
+    heading.set_text(match (invite.cancelled(), invite.sequence > 0) {
+        (true, _) => "This meeting was cancelled",
+        (false, true) => "Updated invitation",
+        (false, false) => "Calendar invitation",
+    });
+    if invite.cancelled() {
+        state.invite_bar.add_css_class("invite-cancelled");
+    }
+    state.invite_bar.append(&heading);
+
+    let when = gtk::Label::builder().label(&invite_when(&invite)).xalign(0.0).wrap(true).build();
+    when.add_css_class("invite-when");
+    state.invite_bar.append(&when);
+
+    for line in [
+        (!invite.location.is_empty()).then(|| invite.location.clone()),
+        (!invite.organizer.address.is_empty() || !invite.organizer.name.is_empty())
+            .then(|| format!("Organised by {}", invite.organizer.display())),
+        invite.recurring.then(|| "Repeats — the series follows once it is on your calendar".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let label = gtk::Label::builder()
+            .label(&line)
+            .xalign(0.0)
+            .ellipsize(EllipsizeMode::End)
+            .build();
+        label.add_css_class("dim-label");
+        label.add_css_class("caption");
+        state.invite_bar.append(&label);
+    }
+
+    if let Some(given) = answered {
+        let said = gtk::Label::builder().label(given.said()).xalign(0.0).wrap(true).build();
+        said.add_css_class("invite-answer");
+        said.add_css_class("dim-label");
+        said.set_margin_top(4);
+        state.invite_bar.append(&said);
+    }
+
+    // A cancellation is not something to answer; it is something to know.
+    if !invite.cancelled() {
+        let buttons = gtk::Box::builder().spacing(6).margin_top(8).build();
+        let choices: &[(Response, &str, &str)] = if invite.can_rsvp() {
+            &[
+                (Response::Accepted, "Accept", "object-select-symbolic"),
+                (Response::Tentative, "Tentative", "dialog-question-symbolic"),
+                (Response::Declined, "Decline", "window-close-symbolic"),
+            ]
+        } else {
+            // No meeting on the server to answer: the appointment is the
+            // only thing on offer, so say exactly that.
+            &[(Response::Accepted, "Add to calendar", "appointment-new-symbolic")]
+        };
+        for (response, label, icon) in choices {
+            let button = gtk::Button::builder()
+                .child(&adw::ButtonContent::builder().icon_name(*icon).label(*label).build())
+                .build();
+            if *response == Response::Accepted {
+                button.add_css_class("suggested-action");
+            }
+            // The answer already given is the one that is set; pressing it
+            // again would only send the same RSVP a second time.
+            button.set_sensitive(answered != Some(*response));
+            let state_for_click = state.clone();
+            let message_id = summary.id.clone();
+            let invite_for_click = invite.clone();
+            let response = *response;
+            button.connect_clicked(move |_| {
+                answer_invite(&state_for_click, &message_id, &invite_for_click, response);
+            });
+            buttons.append(&button);
+        }
+        state.invite_bar.append(&buttons);
+    }
+
+    state.invite_bar.set_visible(true);
+}
+
+/// When the meeting is, in the reader's own time.
+fn invite_when(invite: &Invite) -> String {
+    let local = |iso: &str| DateTime::parse_from_rfc3339(iso).ok().map(|d| d.with_timezone(&Local));
+    if invite.all_day {
+        // Whole days sit on UTC midnight with an exclusive end, so they are
+        // read as dates rather than converted — see the calendar view.
+        return match DateTime::parse_from_rfc3339(&invite.start.utc) {
+            Ok(start) => format!("All day · {}", start.naive_utc().date().format("%A %-d %B %Y")),
+            Err(_) => "All day".to_string(),
+        };
+    }
+    match (local(&invite.start.utc), local(&invite.end.utc)) {
+        (Some(start), Some(end)) if start.date_naive() == end.date_naive() => format!(
+            "{} · {} – {}",
+            start.format("%A %-d %B %Y"),
+            start.format("%H:%M"),
+            end.format("%H:%M")
+        ),
+        (Some(start), Some(end)) => format!(
+            "{} {} – {} {}",
+            start.format("%a %-d %b %Y"),
+            start.format("%H:%M"),
+            end.format("%a %-d %b %Y"),
+            end.format("%H:%M")
+        ),
+        (Some(start), None) => start.format("%A %-d %B %Y · %H:%M").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Answer an invitation: applied here at once, and queued for the server
+/// like every other change, so it works with no network.
+fn answer_invite(state: &Rc<State>, message_id: &str, invite: &Invite, response: Response) {
+    let session_index = state.active_session();
+    let applied = {
+        let sessions = state.sessions.borrow();
+        let Some(session) = sessions.get(session_index) else { return };
+        session.apply(Op::RespondToInvite {
+            message_id: message_id.to_string(),
+            invite: invite.clone(),
+            response,
+        })
+    };
+    if let Err(e) = applied {
+        toast(state, &format!("Could not answer the invitation: {e}"));
+        return;
+    }
+    toast(
+        state,
+        match (invite.can_rsvp(), response) {
+            (true, Response::Accepted) => "Accepted — the organiser has been told",
+            (true, Response::Tentative) => "Answered tentatively — the organiser has been told",
+            (true, Response::Declined) => "Declined — the organiser has been told",
+            (false, Response::Declined) => "Left off your calendar",
+            (false, _) => "Added to your calendar",
+        },
+    );
+    // Redraw the card so it shows the answer, and the calendar with it.
+    if let Some(detail) = current_detail(state) {
+        render_invite(state, &detail.summary);
+        render_attachments(state, &detail.summary);
+    }
+    crate::ui::calendar::refresh(state);
+}
+
 fn clear_attachments(state: &Rc<State>) {
     while let Some(child) = state.attachment_bar.first_child() {
         state.attachment_bar.remove(&child);
@@ -2156,16 +2363,22 @@ fn clear_attachments(state: &Rc<State>) {
 
 /// A button per file the message carries. Pictures that the body embeds
 /// are left out: they are already on screen, and listing every signature
-/// logo would bury the one file that matters.
+/// logo would bury the one file that matters. So is the `.ics` behind an
+/// invitation being shown — the card above is what it is for, and opening
+/// the file by hand does nothing useful.
 fn render_attachments(state: &Rc<State>, summary: &MessageSummary) {
     clear_attachments(state);
     let session_index = state.active_session();
     let Some(db) = state.sessions.borrow().get(session_index).map(|s| s.db.clone()) else { return };
+    let invited = db.invite(&summary.id).is_some();
     let items: Vec<Attachment> = db
         .attachments(&summary.id)
         .unwrap_or_default()
         .into_iter()
         .filter(|item| !item.is_inline)
+        .filter(|item| {
+            !invited || !crate::invite::is_calendar_part(&item.content_type, &item.name)
+        })
         .collect();
     if items.is_empty() {
         // Mail cached before attachments were listed has none recorded;
@@ -2273,6 +2486,7 @@ fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     let Some(detail) = detail else {
         *state.current_message.borrow_mut() = None;
         state.current_thread.borrow_mut().clear();
+        state.invite_bar.set_visible(false);
         clear_attachments(state);
         state.reading.set_visible_child_name("empty");
         return;
@@ -2323,6 +2537,7 @@ fn show_message(state: &Rc<State>, detail: Option<&MessageDetail>) {
     }
 
     update_read_toggle(state, detail.summary.is_read);
+    render_invite(state, &detail.summary);
     render_attachments(state, &detail.summary);
     render_body(state, detail);
     state.reading.set_visible_child_name("message");

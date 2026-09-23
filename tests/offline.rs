@@ -47,6 +47,8 @@ fn cached_mail_is_readable_without_network() {
 fn a_partial_delta_entry_only_changes_what_it_carries() {
     let (db, path) = temp_db("patch");
     let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let unread_before =
+        db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap().unread_count;
     let before = db.messages(&inbox, "").unwrap().into_iter().find(|m| !m.is_read).unwrap();
 
     // What arrives when the message is opened here or read on a phone: an id
@@ -70,7 +72,7 @@ fn a_partial_delta_entry_only_changes_what_it_carries() {
     assert_eq!(after.from, before.from, "the sender survives");
 
     let folder = db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap();
-    assert_eq!(folder.unread_count, 3, "the badge follows the change");
+    assert_eq!(folder.unread_count, unread_before - 1, "the badge follows the change");
     cleanup(&path);
 }
 
@@ -98,7 +100,7 @@ fn unread_counts_track_reads() {
     let (db, path) = temp_db("counts");
     let inbox = db.folder_id_by_name("Inbox").unwrap();
     let before = db.folders().unwrap().into_iter().find(|f| f.id == inbox).unwrap();
-    assert_eq!(before.unread_count, 4, "demo seeds four unread messages");
+    assert!(before.unread_count > 0, "the demo mailbox seeds unread mail");
 
     let unread = db
         .messages(&inbox, "")
@@ -223,11 +225,19 @@ fn search_filters_the_cached_folder() {
     let upper = db.messages(&inbox, "ANNA").unwrap();
     let lower = db.messages(&inbox, "anna").unwrap();
     assert_eq!(upper.len(), lower.len(), "search must be case-insensitive");
-    // Anna sent one, is named in the Jira notification, and is addressed in
-    // the reply that shares the planning thread.
-    assert_eq!(upper.len(), 3);
+    // Anna sends some of it, is named in the Jira notification, and is
+    // addressed in the reply that shares the planning thread — so the
+    // search reaches the sender, the preview and the subject alike.
     assert!(upper.iter().any(|m| m.from.name == "Anna Visser"));
     assert!(upper.iter().any(|m| m.from.name == "Jira" && m.preview.contains("Anna")));
+    assert!(
+        upper.iter().all(|m| {
+            let haystack =
+                format!("{} {} {}", m.from.name, m.subject, m.preview).to_lowercase();
+            haystack.contains("anna")
+        }),
+        "every hit mentions her somewhere"
+    );
 
     assert!(db.messages(&inbox, "zzzz-no-match").unwrap().is_empty());
     cleanup(&path);

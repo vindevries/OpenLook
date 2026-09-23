@@ -16,8 +16,11 @@ use crate::config::{tokens_path, Settings};
 use crate::model::AccountInfo;
 use crate::util::now_unix;
 
+/// Answering an invitation writes to the calendar — creating the
+/// appointment, or letting Exchange move the one it already holds — so
+/// reading it is not enough.
 const SCOPES: &str = "openid profile email offline_access User.Read \
-                      Mail.ReadWrite Mail.Send Calendars.Read";
+                      Mail.ReadWrite Mail.Send Calendars.ReadWrite";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Tokens {

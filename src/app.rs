@@ -130,6 +130,20 @@ const CSS: &str = r#"
   font-size: 0.9em;
 }
 
+/* Calendar invitation, above the body of the message carrying it */
+.invite-card {
+  background: alpha(@accent_bg_color, 0.10);
+  border: 1px solid alpha(@accent_bg_color, 0.35);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.invite-card.invite-cancelled {
+  background: alpha(@destructive_bg_color, 0.10);
+  border-color: alpha(@destructive_bg_color, 0.35);
+}
+.invite-when { font-weight: 700; }
+.invite-answer { font-size: 0.9em; }
+
 /* Calendar */
 .view-rail button { min-width: 34px; padding: 6px; }
 .cal-weekday {

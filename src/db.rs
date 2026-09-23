@@ -10,6 +10,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::graph::folder_rank;
+use crate::invite::{Invite, Response};
 use crate::model::{
     Address, Answered, Attachment, Body, CalendarEvent, Folder, MessageDetail, MessagePatch,
     MessageSummary, Op, Pending,
@@ -95,6 +96,11 @@ CREATE TABLE IF NOT EXISTS events (
     preview   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_utc);
+CREATE TABLE IF NOT EXISTS invites (
+    message_id TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    response   TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
@@ -613,6 +619,7 @@ impl Db {
         let conn = self.conn();
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
+        conn.execute("DELETE FROM invites WHERE message_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -847,6 +854,10 @@ impl Db {
             "UPDATE OR REPLACE attachments SET message_id = ?2 WHERE message_id = ?1",
             params![old_id, new_id],
         )?;
+        conn.execute(
+            "UPDATE OR REPLACE invites SET message_id = ?2 WHERE message_id = ?1",
+            params![old_id, new_id],
+        )?;
         Ok(())
     }
 
@@ -883,7 +894,8 @@ impl Db {
         let message_id = match op {
             Op::MarkRead { message_id, .. }
             | Op::Delete { message_id, .. }
-            | Op::Move { message_id, .. } => Some(message_id.clone()),
+            | Op::Move { message_id, .. }
+            | Op::RespondToInvite { message_id, .. } => Some(message_id.clone()),
             Op::Send { local_id, .. } => Some(local_id.clone()),
         };
         let conn = self.conn();
@@ -941,6 +953,73 @@ impl Db {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(ids)
+    }
+
+    // -- invitations -----------------------------------------------------
+
+    /// Record the invitation a message turned out to carry. The answer
+    /// already given, if any, is left alone: re-reading the mail should
+    /// not forget that it was accepted.
+    pub fn set_invite(&self, message_id: &str, invite: &Invite) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO invites (message_id, payload) VALUES (?1, ?2)
+             ON CONFLICT(message_id) DO UPDATE SET payload = excluded.payload",
+            params![message_id, serde_json::to_string(invite)?],
+        )?;
+        Ok(())
+    }
+
+    /// The invitation a message carries, and the answer given to it.
+    pub fn invite(&self, message_id: &str) -> Option<(Invite, Option<Response>)> {
+        let conn = self.conn();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT payload, response FROM invites WHERE message_id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (payload, response) = row?;
+        let invite = serde_json::from_str::<Invite>(&payload).ok()?;
+        Some((invite, Response::from_str(&response)))
+    }
+
+    pub fn set_invite_response(&self, message_id: &str, response: Response) -> Result<()> {
+        self.conn().execute(
+            "UPDATE invites SET response = ?2 WHERE message_id = ?1",
+            params![message_id, response.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Put one event into the cache without disturbing the rest of the
+    /// window, so an accepted invitation shows on the calendar before the
+    /// server has been told. The next calendar sync replaces it with the
+    /// server's own copy.
+    pub fn upsert_event(&self, event: &CalendarEvent) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO events
+                 (id, subject, organizer, location, start_utc, end_utc,
+                  all_day, cancelled, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                 subject = excluded.subject, organizer = excluded.organizer,
+                 location = excluded.location, start_utc = excluded.start_utc,
+                 end_utc = excluded.end_utc, all_day = excluded.all_day,
+                 cancelled = excluded.cancelled, preview = excluded.preview",
+            params![
+                event.id, event.subject, event.organizer, event.location, event.start,
+                event.end, event.all_day as i64, event.cancelled as i64, event.preview,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_event(&self, id: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM events WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     // -- calendar --------------------------------------------------------

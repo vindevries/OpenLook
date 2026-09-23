@@ -44,6 +44,12 @@ Graph API and keeps a local copy so mail is readable **offline**.
   every mailbox's events (colour-coded), with a day panel showing times,
   location and organiser; double-click an appointment to open it. Cached
   like mail, so it reads offline
+- **Calendar invitations**: an invitation from Outlook or Google shows what
+  it is inviting you to above the message — when, where and who from — with
+  Accept, Tentative and Decline. Where Exchange recognised the invitation
+  your answer goes back to the organiser; where it did not, the `.ics` is
+  read here and the appointment added to your calendar. Answering works
+  offline like every other change
 - **Works offline**: mail is cached in SQLite and message bodies are
   prefetched, so the app opens instantly and stays readable with no network
 - **Changes made offline are queued** — read/unread, delete and messages you
@@ -111,7 +117,7 @@ use the demo mailbox.
 public "Microsoft Graph Command Line Tools" application
 (`14d82eec-204b-4c2f-b7e8-296a70dab67e`), the same public client Microsoft's
 own Graph PowerShell uses, requesting delegated `User.Read`, `Mail.ReadWrite`
-`Mail.Send` and `Calendars.Read` scopes. The first sign-in shows a consent prompt for those
+`Mail.Send` and `Calendars.ReadWrite` scopes. The first sign-in shows a consent prompt for those
 permissions.
 
 If your organization blocks that app, register your own (2 minutes) and paste
@@ -121,8 +127,8 @@ its client ID under **Advanced** in the sign-in dialog, or in Settings:
    **New registration**. No redirect URI needed.
 2. **Authentication** → **Allow public client flows** → **Yes** → Save.
 3. **API permissions** → Microsoft Graph → Delegated: `User.Read`,
-   `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read` (grant admin consent if
-   required).
+   `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite` (grant admin consent
+   if required).
 
 ## Connectors
 
@@ -198,9 +204,11 @@ src/
   plugin.rs     connectors living outside the app, over stdin/stdout
   hubspot.rs    HubSpot REST client, used by the plugin
   demo.rs       demo mailbox seeded into the cache
+  invite.rs     calendar invitations, and enough RFC 5545 to read an .ics
   ui/           window, compose, calendar, dialogs
   bin/openlook-hubspot.rs   the HubSpot plugin
 tests/offline.rs  offline behaviour tests
+tests/invites.rs  reading calendar invitations, and answering them
 tools/dev-shim.sh build without the GTK -dev packages
 tools/mkdeb.sh    package a .deb, optionally for Ubuntu 22.04
 ```
@@ -211,5 +219,6 @@ tools/mkdeb.sh    package a .deb, optionally for Ubuntu 22.04
   original's)
 - Formatting toolbar for the message you write (a forward keeps the
   original's formatting)
-- Creating and editing appointments (the calendar is read-only today)
+- Creating and editing appointments (an invitation can be accepted, but
+  nothing else writes to the calendar yet)
 - Full-text search across folders (the cache makes this cheap)

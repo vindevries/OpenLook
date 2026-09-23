@@ -17,6 +17,7 @@ use crate::config::{account_key, db_path};
 use crate::connector::Connector;
 use crate::db::Db;
 use crate::graph::{Change, Graph, GraphError};
+use crate::invite::{self, Invite, Response};
 use crate::model::{AccountInfo, Address, Body, Folder, MessageSummary, Op, Pending, Status};
 use crate::util::{now_unix, safe_name, short_key};
 
@@ -60,7 +61,7 @@ async fn fetch_body(
     db: &Db,
     id: &str,
 ) -> Result<(Vec<Address>, Vec<Address>, Body), GraphError> {
-    let (to, cc, mut body) = graph.detail(id).await?;
+    let (to, cc, mut body, meeting) = graph.detail(id).await?;
     // The list is what the reading pane offers to open, so record it even
     // when the body refers to none of it.
     let items = match graph.attachments(id).await {
@@ -74,6 +75,11 @@ async fn fetch_body(
             Vec::new()
         }
     };
+    // An invitation is recognised while the body is being fetched, so a
+    // message read offline later still offers to put it on the calendar.
+    if let Err(e) = cache_invite(graph, db, id, meeting, &items).await {
+        eprintln!("openlook: invitation: {e}");
+    }
     if body.content.contains("cid:") {
         let wanted = crate::util::cid_references(&body.content);
         match graph.inline_images(id, &items, &wanted, INLINE_IMAGE_BUDGET).await {
@@ -92,6 +98,64 @@ async fn fetch_body(
         }
     }
     Ok((to, cc, body))
+}
+
+/// Send an answer to an invitation, by whichever route the invitation has.
+///
+/// Exchange can only RSVP for a meeting it holds. For a `.ics` that
+/// arrived as an ordinary attachment there is no such meeting and no
+/// organiser expecting a reply through the server, so accepting it means
+/// creating the appointment — and declining it means there is nothing to
+/// send at all.
+async fn send_invite_response(
+    graph: &Graph,
+    message_id: &str,
+    invite: &Invite,
+    response: Response,
+) -> Result<(), GraphError> {
+    if invite.can_rsvp() {
+        return graph.respond_to_invite(message_id, response).await;
+    }
+    if response == Response::Declined {
+        return Ok(());
+    }
+    graph.create_event(invite).await.map(|_| ())
+}
+
+/// Work out whether a message is a calendar invitation, and cache what it
+/// is inviting you to.
+///
+/// The two shapes are handled the same way from here on: Exchange's own
+/// reading of a meeting request, or the `text/calendar` part of a message
+/// it did not recognise as one.
+async fn cache_invite(
+    graph: &Graph,
+    db: &Db,
+    id: &str,
+    meeting: bool,
+    items: &[crate::model::Attachment],
+) -> Result<(), GraphError> {
+    if meeting {
+        if let Some(found) = graph.meeting_invite(id).await? {
+            let _ = db.set_invite(id, &found);
+            return Ok(());
+        }
+    }
+    let Some(part) = items
+        .iter()
+        .find(|item| invite::is_calendar_part(&item.content_type, &item.name))
+    else {
+        return Ok(());
+    };
+    // An .ics is a few kilobytes, so it is fetched with the body rather
+    // than waiting for someone to ask — which is what lets the invitation
+    // be answered with no network.
+    let bytes = graph.attachment_bytes(id, &part.id).await?;
+    let text = String::from_utf8_lossy(&bytes);
+    if let Some(found) = invite::parse(&text) {
+        let _ = db.set_invite(id, &found);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +201,9 @@ pub enum Cmd {
     OpenMessage(String),
     /// Make sure the list of what a message carries is cached.
     ListAttachments(String),
+    /// Work out whether a message carries an invitation, for mail that was
+    /// cached before invitations were read.
+    EnsureInvite(String),
     /// Download an attachment if it is not already on disk, ready to open.
     OpenAttachment { message_id: String, attachment_id: String },
     /// Make sure an appointment's body is cached.
@@ -157,6 +224,8 @@ pub enum Event {
     NewMail(Vec<MessageSummary>),
     /// The list of files a message carries has arrived.
     AttachmentsChanged(String),
+    /// A message turned out to carry a calendar invitation.
+    InviteChanged(String),
     /// An attachment is on disk at this path, ready to be opened.
     AttachmentReady { message_id: String, attachment_id: String, path: String },
     CalendarChanged,
@@ -210,6 +279,7 @@ impl Session {
             label: mode.label(),
             key: mode.key(),
             seen: std::collections::HashSet::new(),
+            invite_checked: std::collections::HashSet::new(),
         };
         runtime().spawn(engine.run(cmd_rx));
         Ok(Session { db, mode, cmd_tx, events })
@@ -305,6 +375,21 @@ pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
             let cc: Vec<_> = message.cc.iter().map(crate::model::Address::bare).collect();
             db.insert_local_message(&summary, &to, &cc, &body)?;
         }
+        Op::RespondToInvite { message_id, invite, response } => {
+            db.set_invite_response(message_id, *response)?;
+            // A meeting request is already on the calendar — Exchange put
+            // it there as tentative when it arrived — so answering it
+            // moves an appointment that exists rather than making one.
+            // A bare .ics has no such appointment, so accepting it shows
+            // one straight away and the server is told afterwards.
+            if !invite.meeting_request {
+                let event = invite.as_event("");
+                match response {
+                    Response::Declined => db.remove_event(&event.id)?,
+                    _ => db.upsert_event(&event)?,
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -349,6 +434,10 @@ struct Engine {
     /// Folders this run has already been through. The first pass over a
     /// folder is the cache catching up, not mail arriving, so it is quiet.
     seen: std::collections::HashSet<String>,
+    /// Messages already looked at for an invitation. Mail that carries
+    /// none is the common case, and the answer does not change, so it is
+    /// worth asking only once.
+    invite_checked: std::collections::HashSet<String>,
 }
 
 impl Engine {
@@ -404,6 +493,7 @@ impl Engine {
             }
             Cmd::OpenMessage(id) => self.ensure_body(&id).await,
             Cmd::ListAttachments(id) => self.ensure_attachment_list(&id).await,
+            Cmd::EnsureInvite(id) => self.ensure_invite(&id).await,
             Cmd::OpenAttachment { message_id, attachment_id } => {
                 self.ensure_attachment(&message_id, &attachment_id).await
             }
@@ -694,6 +784,11 @@ impl Engine {
     /// truth for that range, so cancellations disappear too.
     async fn sync_calendar(&mut self, start: &str, end: &str) {
         let Some(graph) = self.backend.mail() else { return };
+        // An invitation accepted a moment ago is a local event until the
+        // server has been told about it, and the fetch below is the
+        // server's word on this window — so push first, or accepting one
+        // and looking at the calendar would make it disappear.
+        self.flush().await;
         let events = graph.calendar_view(start, end).await;
         self.note_result(&events);
         if let Ok(events) = events {
@@ -815,6 +910,31 @@ impl Engine {
         }
     }
 
+    /// Look at a message that was cached before invitations were read, and
+    /// work out whether it carries one.
+    ///
+    /// Mail fetched from now on is checked as its body arrives, so this is
+    /// only for what the cache already held — and the answer never changes,
+    /// so a message that turns out to carry nothing is not asked about
+    /// again this run.
+    async fn ensure_invite(&mut self, message_id: &str) {
+        if self.db.invite(message_id).is_some() || !self.invite_checked.insert(message_id.to_string())
+        {
+            return;
+        }
+        let Some(graph) = self.backend.mail() else { return };
+        let items = self.db.attachments(message_id).unwrap_or_default();
+        let result = cache_invite(&graph, &self.db, message_id, true, &items).await;
+        // A failure here is worth another try, unlike an honest "no".
+        if result.is_err() {
+            self.invite_checked.remove(message_id);
+        }
+        self.note_result(&result);
+        if self.db.invite(message_id).is_some() {
+            self.emit(Event::InviteChanged(message_id.to_string()));
+        }
+    }
+
     /// Put an attachment on disk so the desktop can open it. Already
     /// downloaded, it is served straight from the cache — which is what
     /// makes an attachment readable again with no network.
@@ -900,6 +1020,9 @@ impl Engine {
                     .await
                     .map(|new_id| self.adopt_new_id(message_id, new_id)),
                 Op::Send { message, .. } => graph.send_mail(message).await,
+                Op::RespondToInvite { message_id, invite, response } => {
+                    send_invite_response(&graph, message_id, invite, *response).await
+                }
             };
             match result {
                 Ok(()) => {

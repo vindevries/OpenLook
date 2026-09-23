@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::auth::Auth;
+use crate::invite::{Invite, InviteTime, Method, Response};
 use crate::model::{
     Address, Attachment, Body, CalendarEvent, Folder, MessagePatch, MessageSummary, Outgoing,
     Pending, SendMode,
@@ -571,8 +572,13 @@ impl Graph {
         Ok(out)
     }
 
-    /// Full message: recipients plus the body.
-    pub async fn detail(&self, id: &str) -> GraphResult<(Vec<Address>, Vec<Address>, Body)> {
+    /// Full message: recipients, the body, and whether Exchange turned it
+    /// into a meeting request.
+    ///
+    /// The last of those costs nothing to ask for: Graph stamps
+    /// `@odata.type` on anything that is not a plain message, which is
+    /// exactly how a meeting request announces itself.
+    pub async fn detail(&self, id: &str) -> GraphResult<(Vec<Address>, Vec<Address>, Body, bool)> {
         let url = format!(
             "/me/messages/{}?$select=toRecipients,ccRecipients,body",
             urlencoding::encode(id)
@@ -584,7 +590,89 @@ impl Graph {
             is_html: m["body"]["contentType"].as_str().unwrap_or("html") != "text",
             content: m["body"]["content"].as_str().unwrap_or_default().to_string(),
         };
-        Ok((to, cc, body))
+        let meeting = m["@odata.type"].as_str().unwrap_or_default().contains("eventMessage");
+        Ok((to, cc, body, meeting))
+    }
+
+    /// The appointment behind a meeting request.
+    ///
+    /// Exchange has already parsed the invitation — whether it came from
+    /// Outlook or from Google — and put the appointment on the calendar as
+    /// tentative, so this reads what it made of it rather than the
+    /// `text/calendar` part, which such a message does not even carry.
+    pub async fn meeting_invite(&self, message_id: &str) -> GraphResult<Option<Invite>> {
+        let url = format!(
+            "/me/messages/{}?$expand=microsoft.graph.eventMessage/event",
+            urlencoding::encode(message_id)
+        );
+        let m = self.get(&url).await?;
+        let event = &m["event"];
+        if !event.is_object() {
+            return Ok(None);
+        }
+        // Graph names the kind of meeting message this is: a fresh
+        // invitation, an update, or a cancellation.
+        let method = match m["meetingMessageType"].as_str().unwrap_or("meetingRequest") {
+            "meetingCancelled" => Method::Cancel,
+            "meetingAccepted" | "meetingTentativelyAccepted" | "meetingDeclined" => Method::Reply,
+            _ => Method::Request,
+        };
+        let time = |value: &Value| -> InviteTime {
+            let utc = graph_time(value);
+            InviteTime {
+                local: utc.trim_end_matches('Z').to_string(),
+                tzid: String::new(),
+                utc,
+            }
+        };
+        Ok(Some(Invite {
+            uid: event["iCalUId"]
+                .as_str()
+                .filter(|uid| !uid.is_empty())
+                .unwrap_or_else(|| event["id"].as_str().unwrap_or(message_id))
+                .to_string(),
+            method,
+            sequence: 0,
+            subject: event["subject"].as_str().unwrap_or_default().to_string(),
+            organizer: parse_address(&event["organizer"]),
+            location: event["location"]["displayName"].as_str().unwrap_or_default().to_string(),
+            description: html_to_text(event["bodyPreview"].as_str().unwrap_or_default()),
+            start: time(&event["start"]),
+            end: time(&event["end"]),
+            all_day: event["isAllDay"].as_bool().unwrap_or(false),
+            recurring: event["type"].as_str().unwrap_or("singleInstance") != "singleInstance",
+            attendees: event["attendees"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(parse_address)
+                .collect(),
+            meeting_request: true,
+        }))
+    }
+
+    /// Answer a meeting request. Exchange moves the appointment on the
+    /// calendar and mails the RSVP to the organiser.
+    pub async fn respond_to_invite(&self, message_id: &str, response: Response) -> GraphResult<()> {
+        let url = format!(
+            "{GRAPH}/me/messages/{}/{}",
+            urlencoding::encode(message_id),
+            response.graph_action()
+        );
+        self.send(self.http.post(url).json(&json!({ "sendResponse": true }))).await?;
+        Ok(())
+    }
+
+    /// Put an event on the calendar outright.
+    ///
+    /// This is the path for an invitation Exchange did not recognise — a
+    /// `.ics` attached to an ordinary message. There is no meeting on the
+    /// server to answer, so accepting it means creating the appointment.
+    pub async fn create_event(&self, invite: &Invite) -> GraphResult<Option<String>> {
+        let url = format!("{GRAPH}/me/events");
+        let created = self.send(self.http.post(url).json(&invite.as_graph_event())).await?;
+        Ok(created.and_then(|e| e["id"].as_str().map(str::to_string)))
     }
 
     pub async fn set_read(&self, id: &str, is_read: bool) -> GraphResult<()> {

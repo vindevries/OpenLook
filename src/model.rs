@@ -224,6 +224,16 @@ pub enum Op {
         local_id: String,
         message: Outgoing,
     },
+    /// An answer to a calendar invitation. The whole invitation travels
+    /// with it, because an RSVP that cannot reach the organiser through
+    /// the message still has to put the appointment on the calendar, and
+    /// by the time the queue is replayed the mail may have been filed
+    /// somewhere else.
+    RespondToInvite {
+        message_id: String,
+        invite: crate::invite::Invite,
+        response: crate::invite::Response,
+    },
 }
 
 impl Op {
@@ -234,6 +244,7 @@ impl Op {
             Op::Delete { .. } => "delete",
             Op::Move { .. } => "move",
             Op::Send { .. } => "send",
+            Op::RespondToInvite { .. } => "invite_response",
         }
     }
 }

@@ -2,10 +2,11 @@
 //! offline behaviour — works before anyone signs in.
 
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::{Duration, Local, TimeZone, Utc};
 
 use crate::db::Db;
 use crate::graph::folder_rank;
+use crate::invite::{Invite, InviteTime, Method};
 use crate::model::{Address, Body, CalendarEvent, Folder, MessageSummary, Pending};
 use crate::util::html_to_text;
 
@@ -219,6 +220,32 @@ pub fn seed(db: &Db) -> Result<()> {
             to: &[OWNER],
         },
         Seed {
+            folder: "inbox",
+            from: ("Anna Visser", "anna.visser@contoso.com"),
+            subject: "Q1 budget review — invitation",
+            paragraphs: &[
+                "Anna Visser has invited you to <b>Q1 budget review</b>.",
+                "Roadmap, hiring plan and the budget checkpoint. Answering here \
+                 sends your reply to Anna.",
+            ],
+            age_hours: 5,
+            unread: true,
+            to: &[OWNER],
+        },
+        Seed {
+            folder: "inbox",
+            from: ("Sofia Lindqvist", "sofia.lindqvist@example.com"),
+            subject: "Design review — invitation",
+            paragraphs: &[
+                "Sofia Lindqvist has invited you to <b>Design review</b>.",
+                "We will walk through the new reading pane. Joining details are in \
+                 the invitation below.",
+            ],
+            age_hours: 3,
+            unread: true,
+            to: &[OWNER],
+        },
+        Seed {
             folder: "archive",
             from: ("HR Team", "hr@opslogix.com"),
             subject: "Summer party photos",
@@ -254,6 +281,83 @@ pub fn seed(db: &Db) -> Result<()> {
     }
     db.recompute_counts()?;
     seed_events(db)?;
+    seed_invites(db, seeds)?;
+    Ok(())
+}
+
+/// The two shapes an invitation arrives in, so both can be seen without an
+/// account: one Exchange turned into a meeting request, and one that came
+/// in as a plain message with a `.ics` on it.
+fn seed_invites(db: &Db, seeds: &[Seed]) -> Result<()> {
+    let find = |subject: &str| -> Option<String> {
+        seeds
+            .iter()
+            .position(|seed| seed.subject == subject)
+            .map(|index| format!("demo-{index}"))
+    };
+    // Tomorrow afternoon, in the reader's own timezone, so the invitation
+    // lands somewhere the calendar can show it.
+    let start = (Local::now() + Duration::days(1))
+        .date_naive()
+        .and_hms_opt(14, 0, 0)
+        .and_then(|naive| Local.from_local_datetime(&naive).single())
+        .unwrap_or_else(Local::now)
+        .with_timezone(&Utc);
+    let at = |offset: i64| -> InviteTime {
+        let when = start + Duration::minutes(offset);
+        InviteTime {
+            local: when.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            tzid: String::new(),
+            utc: when.to_rfc3339(),
+        }
+    };
+
+    let invitations = [
+        (
+            "Design review — invitation",
+            Invite {
+                uid: "demo-invite-google@example.com".into(),
+                method: Method::Request,
+                sequence: 0,
+                subject: "Design review".into(),
+                organizer: Address::new("Sofia Lindqvist", "sofia.lindqvist@example.com"),
+                location: "Google Meet".into(),
+                description: "Walking through the new reading pane.".into(),
+                start: at(0),
+                end: at(60),
+                all_day: false,
+                recurring: false,
+                attendees: vec![Address::new("You", OWNER.1)],
+                // Nothing on a server recognised it, so the only thing on
+                // offer is putting it on the calendar.
+                meeting_request: false,
+            },
+        ),
+        (
+            "Q1 budget review — invitation",
+            Invite {
+                uid: "demo-invite-outlook@example.com".into(),
+                method: Method::Request,
+                sequence: 0,
+                subject: "Q1 budget review".into(),
+                organizer: Address::new("Anna Visser", "anna.visser@contoso.com"),
+                location: "Board room".into(),
+                description: "Roadmap, hiring plan, budget checkpoint.".into(),
+                start: at(180),
+                end: at(240),
+                all_day: false,
+                recurring: true,
+                attendees: vec![Address::new("You", OWNER.1)],
+                // A meeting request, so this one can be answered properly.
+                meeting_request: true,
+            },
+        ),
+    ];
+    for (subject, invite) in invitations {
+        if let Some(id) = find(subject) {
+            db.set_invite(&id, &invite)?;
+        }
+    }
     Ok(())
 }
 
