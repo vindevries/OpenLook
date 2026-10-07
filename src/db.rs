@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS events (
     preview   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_utc);
+CREATE TABLE IF NOT EXISTS local_reads (
+    message_id TEXT PRIMARY KEY,
+    is_read    INTEGER NOT NULL,
+    at         INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS invites (
     message_id TEXT PRIMARY KEY,
     payload    TEXT NOT NULL,
@@ -103,6 +108,12 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
+
+/// How long a read flag the user set defends itself against a server that
+/// disagrees. The note clears as soon as the server reports the same value,
+/// so this only bounds the case where it never does — a change that was
+/// rejected, or pushed from a build that has since been replaced.
+const LOCAL_READ_TTL: i64 = 60 * 60;
 
 #[derive(Clone)]
 pub struct Db {
@@ -458,11 +469,16 @@ impl Db {
 
     /// Insert or refresh message summaries from the server. Messages with
     /// queued local changes are left alone so an in-flight sync cannot undo
-    /// what the user just did offline.
+    /// what the user just did offline, and a read flag the user set keeps
+    /// its value until the server reports the same thing back.
     pub fn upsert_messages(&self, messages: &[MessageSummary]) -> Result<()> {
         let pending = self.pending_message_ids()?;
+        let notes = self.local_reads()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // Notes the server has caught up with. Cleared inside the same
+        // transaction, so the connection is never asked for twice.
+        let mut settled: Vec<&str> = Vec::new();
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages
@@ -484,6 +500,25 @@ impl Db {
                 if pending.contains(&m.id) {
                     continue;
                 }
+                // A read flag the user set outranks the server's until the
+                // server reports the same thing; agreement is what settles
+                // it. A message not cached yet has nothing to defend.
+                let is_read = match notes.get(&m.id) {
+                    None => m.is_read,
+                    Some(ours) if *ours == m.is_read => {
+                        settled.push(&m.id);
+                        m.is_read
+                    }
+                    Some(ours) => tx
+                        .query_row(
+                            "SELECT is_read FROM messages WHERE id = ?1",
+                            params![m.id],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .map(|v| v != 0)
+                        .unwrap_or(*ours),
+                };
                 stmt.execute(params![
                     m.id,
                     m.folder_id,
@@ -492,11 +527,14 @@ impl Db {
                     m.from.address,
                     m.received,
                     m.preview,
-                    m.is_read as i64,
+                    is_read as i64,
                     m.has_attachments as i64,
                     m.conversation_id,
                 ])?;
             }
+        }
+        for id in settled {
+            tx.execute("DELETE FROM local_reads WHERE message_id = ?1", params![id])?;
         }
         tx.commit()?;
         Ok(())
@@ -511,6 +549,7 @@ impl Db {
             return Ok(());
         }
         let pending = self.pending_message_ids()?;
+        let notes = self.local_reads()?;
         for patch in patches {
             if pending.contains(&patch.id) {
                 continue;
@@ -532,7 +571,9 @@ impl Db {
                 }
             }
             if let Some(is_read) = patch.is_read {
-                self.set_read(&patch.id, is_read)?;
+                if let Some(settled) = self.reconcile_read(&notes, &patch.id, is_read) {
+                    self.set_read(&patch.id, settled)?;
+                }
             }
             let (from_name, from_addr) = match &patch.from {
                 Some(from) => (Some(&from.name), Some(&from.address)),
@@ -620,6 +661,7 @@ impl Db {
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
         conn.execute("DELETE FROM invites WHERE message_id = ?1", params![id])?;
+        conn.execute("DELETE FROM local_reads WHERE message_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -858,6 +900,10 @@ impl Db {
             "UPDATE OR REPLACE invites SET message_id = ?2 WHERE message_id = ?1",
             params![old_id, new_id],
         )?;
+        conn.execute(
+            "UPDATE OR REPLACE local_reads SET message_id = ?2 WHERE message_id = ?1",
+            params![old_id, new_id],
+        )?;
         Ok(())
     }
 
@@ -944,6 +990,70 @@ impl Db {
             params![id, error],
         )?;
         Ok(())
+    }
+
+    // -- local read state ------------------------------------------------
+
+    /// Remember that the user, not the server, decided whether a message is
+    /// read.
+    ///
+    /// The outbox protects a change only while it is queued, and a change
+    /// is pushed within a second of being made — so without this, a sync
+    /// already in flight, or a server that has not caught up with the
+    /// change it was just sent, puts the message straight back. The note is
+    /// dropped the moment the server reports the same thing, which is the
+    /// server agreeing rather than contradicting.
+    pub fn note_local_read(&self, message_id: &str, is_read: bool) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO local_reads (message_id, is_read, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(message_id) DO UPDATE SET
+                 is_read = excluded.is_read, at = excluded.at",
+            params![message_id, is_read as i64, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the note, so the server's word is taken from here on. Used
+    /// when the change turns out never to be reaching the server.
+    pub fn clear_local_read(&self, message_id: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM local_reads WHERE message_id = ?1", params![message_id])?;
+        Ok(())
+    }
+
+    /// What the user last said about each message, dropping notes old
+    /// enough that the server is plainly never going to confirm them.
+    fn local_reads(&self) -> Result<std::collections::HashMap<String, bool>> {
+        let cutoff = now_unix() - LOCAL_READ_TTL;
+        let conn = self.conn();
+        let _ = conn.execute("DELETE FROM local_reads WHERE at < ?1", params![cutoff]);
+        let mut stmt = conn.prepare("SELECT message_id, is_read FROM local_reads")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
+    /// Decide what a message's read flag should become, given what the
+    /// server says and what the user said. Returns `None` to leave the
+    /// cached value alone.
+    ///
+    /// Agreement is what clears the note: once the server reports the value
+    /// the user chose, it has caught up and there is nothing left to defend.
+    fn reconcile_read(
+        &self,
+        notes: &std::collections::HashMap<String, bool>,
+        message_id: &str,
+        from_server: bool,
+    ) -> Option<bool> {
+        match notes.get(message_id) {
+            None => Some(from_server),
+            Some(ours) if *ours == from_server => {
+                let _ = self.clear_local_read(message_id);
+                Some(from_server)
+            }
+            Some(_) => None,
+        }
     }
 
     fn pending_message_ids(&self) -> Result<HashSet<String>> {

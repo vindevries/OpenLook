@@ -463,3 +463,177 @@ fn an_attachment_name_cannot_escape_its_directory() {
     // Ordinary names are left alone.
     assert_eq!(openlook::util::safe_name("Quote 2026.pdf"), "Quote 2026.pdf");
 }
+
+/// What the sync engine actually does, in order, when a message is marked
+/// unread: apply it locally, queue it, push it, drop it from the queue —
+/// and then a sync arrives carrying the server's view of the same message.
+///
+/// While the change sits in the outbox it is protected. The moment it is
+/// pushed and dequeued that protection is gone, so a refresh that was
+/// already in flight — or a server that has not caught up — puts the
+/// message straight back to read.
+#[test]
+fn a_pushed_change_is_not_undone_by_a_sync_that_has_not_caught_up() {
+    let (db, path) = temp_db("echo");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| m.is_read).unwrap();
+
+    // Mark it unread: applied here at once, queued for the server.
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: false };
+    apply_local(&db, &op).unwrap();
+    let row = db.enqueue(&op).unwrap();
+    assert!(!db.message(&target.id).unwrap().unwrap().summary.is_read);
+
+    // The engine pushes it and takes it off the queue.
+    db.dequeue(row).unwrap();
+
+    // Now a delta lands that still describes the message as read.
+    db.patch_messages(&[MessagePatch {
+        id: target.id.clone(),
+        is_read: Some(true),
+        ..Default::default()
+    }])
+    .unwrap();
+
+    assert!(
+        !db.message(&target.id).unwrap().unwrap().summary.is_read,
+        "a sync that has not caught up must not undo the change just pushed"
+    );
+    cleanup(&path);
+}
+
+/// The defence is against a server that is behind, not against the server.
+/// Once it reports what the user chose it has caught up, and a genuine
+/// change made elsewhere afterwards — read on a phone, say — must land.
+#[test]
+fn once_the_server_agrees_it_is_back_in_charge() {
+    let (db, path) = temp_db("echo-settles");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| m.is_read).unwrap();
+
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: false };
+    apply_local(&db, &op).unwrap();
+    db.dequeue(db.enqueue(&op).unwrap()).unwrap();
+
+    // The server catches up and reports it unread too.
+    let patch = |is_read| MessagePatch {
+        id: target.id.clone(),
+        is_read: Some(is_read),
+        ..Default::default()
+    };
+    db.patch_messages(&[patch(false)]).unwrap();
+    assert!(!db.message(&target.id).unwrap().unwrap().summary.is_read);
+
+    // Now it is read on a phone. That is news, not a stale echo.
+    db.patch_messages(&[patch(true)]).unwrap();
+    assert!(
+        db.message(&target.id).unwrap().unwrap().summary.is_read,
+        "a real change made elsewhere must still arrive"
+    );
+    cleanup(&path);
+}
+
+/// A whole-summary sync overwrites every column, so it needs the same
+/// defence as a fields-only one — this is the path a first enumeration of
+/// a folder takes.
+#[test]
+fn a_full_resync_does_not_undo_a_pushed_change_either() {
+    let (db, path) = temp_db("echo-upsert");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| m.is_read).unwrap();
+
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: false };
+    apply_local(&db, &op).unwrap();
+    db.dequeue(db.enqueue(&op).unwrap()).unwrap();
+
+    let stale = openlook::model::MessageSummary { is_read: true, ..target.clone() };
+    db.upsert_messages(&[stale.clone()]).unwrap();
+    assert!(
+        !db.message(&target.id).unwrap().unwrap().summary.is_read,
+        "a full resync must not undo the change just pushed"
+    );
+
+    // And the rest of the summary still refreshes around the defended flag.
+    let renamed = openlook::model::MessageSummary {
+        subject: "Renamed on the server".into(),
+        is_read: true,
+        ..target.clone()
+    };
+    db.upsert_messages(&[renamed]).unwrap();
+    let after = db.message(&target.id).unwrap().unwrap().summary;
+    assert_eq!(after.subject, "Renamed on the server");
+    assert!(!after.is_read, "only the read flag is held back");
+    cleanup(&path);
+}
+
+/// Marking as read is defended the same way round.
+#[test]
+fn marking_read_is_defended_too() {
+    let (db, path) = temp_db("echo-read");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| !m.is_read).unwrap();
+
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: true };
+    apply_local(&db, &op).unwrap();
+    db.dequeue(db.enqueue(&op).unwrap()).unwrap();
+
+    db.patch_messages(&[MessagePatch {
+        id: target.id.clone(),
+        is_read: Some(false),
+        ..Default::default()
+    }])
+    .unwrap();
+    assert!(db.message(&target.id).unwrap().unwrap().summary.is_read);
+    cleanup(&path);
+}
+
+/// A change the server refused is not worth defending: holding the local
+/// value would show something that is not true of the mailbox.
+#[test]
+fn a_refused_change_gives_way_to_the_server() {
+    let (db, path) = temp_db("echo-refused");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| m.is_read).unwrap();
+
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: false };
+    apply_local(&db, &op).unwrap();
+    db.dequeue(db.enqueue(&op).unwrap()).unwrap();
+    // What the engine does when the push comes back refused outright.
+    db.clear_local_read(&target.id).unwrap();
+
+    db.patch_messages(&[MessagePatch {
+        id: target.id.clone(),
+        is_read: Some(true),
+        ..Default::default()
+    }])
+    .unwrap();
+    assert!(
+        db.message(&target.id).unwrap().unwrap().summary.is_read,
+        "with nothing left to defend, the mailbox is the truth"
+    );
+    cleanup(&path);
+}
+
+/// The note travels with the message when the server renames it, which is
+/// what a move does — otherwise filing a message you just marked unread
+/// would lose the mark.
+#[test]
+fn a_defended_read_flag_survives_a_server_move() {
+    let (db, path) = temp_db("echo-move");
+    let inbox = db.folder_id_by_name("Inbox").unwrap();
+    let target = db.messages(&inbox, "").unwrap().into_iter().find(|m| m.is_read).unwrap();
+
+    let op = Op::MarkRead { message_id: target.id.clone(), is_read: false };
+    apply_local(&db, &op).unwrap();
+    db.dequeue(db.enqueue(&op).unwrap()).unwrap();
+    db.rename_message(&target.id, "moved-id").unwrap();
+
+    db.patch_messages(&[MessagePatch {
+        id: "moved-id".into(),
+        is_read: Some(true),
+        ..Default::default()
+    }])
+    .unwrap();
+    assert!(!db.message("moved-id").unwrap().unwrap().summary.is_read);
+    cleanup(&path);
+}

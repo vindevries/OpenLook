@@ -339,7 +339,12 @@ impl Session {
 /// The local half of an operation — what the user sees happen instantly.
 pub fn apply_local(db: &Db, op: &Op) -> anyhow::Result<()> {
     match op {
-        Op::MarkRead { message_id, is_read } => db.set_read(message_id, *is_read)?,
+        Op::MarkRead { message_id, is_read } => {
+            db.set_read(message_id, *is_read)?;
+            // Remember that this was the user's doing, so a sync carrying
+            // the server's older view cannot undo it.
+            db.note_local_read(message_id, *is_read)?;
+        }
         Op::Delete { message_id, purge } => match (purge, db.folder_id_by_name("Deleted Items")) {
             (false, Some(bin)) => db.move_message(message_id, &bin)?,
             _ => db.remove_message(message_id)?,
@@ -1038,6 +1043,9 @@ impl Engine {
                 Err(GraphError::NotFound) => {
                     // Already gone server-side; nothing left to do.
                     let _ = self.db.dequeue(row_id);
+                    if let Op::MarkRead { message_id, .. } = &op {
+                        let _ = self.db.clear_local_read(message_id);
+                    }
                 }
                 Err(e) if e.should_retry() => {
                     let _ = self.db.record_failure(row_id, &e.to_string());
@@ -1053,6 +1061,11 @@ impl Engine {
                 }
                 Err(e) => {
                     let _ = self.db.dequeue(row_id);
+                    if let Op::MarkRead { message_id, .. } = &op {
+                        // The server will never report what was asked for,
+                        // so its word is the better one from here on.
+                        let _ = self.db.clear_local_read(message_id);
+                    }
                     if let Op::Send { local_id, .. } = &op {
                         // Keep what was written: it moves to Drafts, marked
                         // as refused, rather than sitting in Sent Items
